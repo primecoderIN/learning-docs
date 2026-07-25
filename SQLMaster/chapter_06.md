@@ -141,7 +141,63 @@ var topStations = await context.Sessions
 
 ---
 
-## 6.6 Performance & Security Analysis
+## 6.6 The Code: Offset vs Keyset (Cursor) Pagination (EF Core & Dapper)
+
+While `OFFSET/FETCH` is easy to write, as we discussed, it degrades massively on deep pages. The enterprise standard is **Keyset (Cursor) Pagination**, where you use the last viewed item's unique, sorted value as an anchor.
+
+### EF Core: Offset vs Keyset
+
+**Bad (Offset):**
+```csharp
+// Fetches page 10,000. SQL Server reads 500,000 rows, discards 499,950.
+var offsetPage = await context.Sessions
+    .OrderByDescending(s => s.StartTime)
+    .Skip(499950)
+    .Take(50)
+    .ToListAsync();
+```
+
+**Good (Keyset/Cursor):**
+```csharp
+// Fetches the exact 50 rows instantly using a B-Tree index seek.
+// Assuming the client passed `cursorTime` from the last record of the previous page.
+var keysetPage = await context.Sessions
+    .Where(s => s.StartTime < cursorTime)
+    .OrderByDescending(s => s.StartTime)
+    .Take(50)
+    .ToListAsync();
+```
+
+### Dapper: Offset vs Keyset
+
+Dapper requires you to write the raw SQL, which gives you complete control over the execution plan.
+
+**Bad (Offset):**
+```csharp
+string sql = @"
+    SELECT SessionId, StartTime, TotalCost 
+    FROM core.Sessions 
+    ORDER BY StartTime DESC 
+    OFFSET @Offset ROWS FETCH NEXT @Take ROWS ONLY;";
+
+var sessions = await db.QueryAsync<SessionDto>(sql, new { Offset = 499950, Take = 50 });
+```
+
+**Good (Keyset/Cursor):**
+```csharp
+string sql = @"
+    SELECT TOP (@Take) SessionId, StartTime, TotalCost 
+    FROM core.Sessions 
+    WHERE StartTime < @CursorTime 
+    ORDER BY StartTime DESC;";
+
+var sessions = await db.QueryAsync<SessionDto>(sql, new { CursorTime = lastSeenTime, Take = 50 });
+```
+*(Architect Note: Always ensure the column used for the Cursor—in this case `StartTime`—is indexed and highly unique. If you have thousands of duplicate timestamps, you must use a tie-breaker column like `SessionId` in both the `WHERE` and `ORDER BY` clauses to ensure deterministic sorting).*
+
+---
+
+## 6.7 Performance & Security Analysis
 
 ### Performance Analysis: The Sort/Hash Warning
 When SQL Server executes a `GROUP BY`, it typically uses a **Hash Match Aggregate** or a **Stream Aggregate**.
@@ -154,14 +210,14 @@ If you open an Execution Plan and see a yellow warning triangle over a "Sort" or
 
 ---
 
-## 6.7 Common Mistakes & Production Pitfalls
+## 6.8 Common Mistakes & Production Pitfalls
 
 1.  **Deep Pagination (The OFFSET Trap):** As `OFFSET` grows, performance degrades. `OFFSET 100000 FETCH NEXT 50` requires the database to internally read and sort 100,050 rows, discard the first 100,000, and return 50. For deep pagination, implement **Keyset Pagination** (e.g., `WHERE StartTime < LastSeenStartTime ORDER BY StartTime DESC FETCH NEXT 50`).
 2.  **Counting Rows Inefficiently:** Running `SELECT COUNT(*)` on a 50-million row table is slow because it physically counts the rows. If you only need an *approximate* count for a dashboard, query the Dynamic Management Views (DMVs) which store row counts as metadata.
 
 ---
 
-## 6.8 Production Checklist
+## 6.9 Production Checklist
 
 *   [ ] API endpoints enforcing pagination have a hardcoded upper limit on page size.
 *   [ ] Deep pagination use cases (like endless scrolling feeds) use Keyset Pagination instead of `OFFSET/FETCH`.
@@ -170,7 +226,7 @@ If you open an Execution Plan and see a yellow warning triangle over a "Sort" or
 
 ---
 
-## 6.9 Exercises
+## 6.10 Exercises
 
 1.  **Query Translation:** A business analyst asks: *"For Tenant 'T1', how many total charging sessions occurred on each Port, but only show Ports that have had more than 50 sessions?"*
     Write the T-SQL query using `WHERE`, `GROUP BY`, and `HAVING`.
@@ -178,7 +234,7 @@ If you open an Execution Plan and see a yellow warning triangle over a "Sort" or
 
 ---
 
-## 6.10 Interview Questions
+## 6.11 Interview Questions
 
 **Q1: Explain the difference between `WHERE` and `HAVING`. Can you use them both in the same query?**
 *Answer:* Yes, they are frequently used together. The `WHERE` clause filters individual rows *before* they are grouped and aggregated (Step 2 of Logical Query Processing). The `HAVING` clause filters the aggregated results *after* they are grouped (Step 4). For example, you use `WHERE` to limit data to the current year, and `HAVING` to return only groups that generated more than $1000.
