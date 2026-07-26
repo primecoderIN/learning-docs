@@ -91,28 +91,36 @@ Throughout this book, you will find continuous references to our ongoing case st
 - Concurrent Collections and Channels (`System.Threading.Channels`)
 - *Case Study:* High-Throughput Message Processing Pipeline
 
-### Part V: Enterprise Software Architecture
-**Chapter 11: ASP.NET Core Integration & Internals**
+### Part V: Building Web APIs with ASP.NET Core
+**Chapter 11: ASP.NET Core Fundamentals**
+- RESTful API Design and HTTP Verbs
+- Routing, Route Parameters, and Query Strings
+- Model Binding and JSON Serialization
+- Returning `IResult` and Status Codes
+- *Case Study:* Building the EV Charger Configuration API
+
+**Chapter 12: ASP.NET Core Integration & Internals**
 - The Request Pipeline and Kestrel Internals
 - Minimal APIs vs. MVC: Performance Trade-offs
 - The Dependency Injection Container (`IServiceProvider`)
 - Middleware, Authentication, and Authorization (RBAC)
 - *Case Study:* Securing the EV Platform API
 
-**Chapter 12: Clean Architecture and CQRS**
+### Part VI: Enterprise Software Architecture
+**Chapter 13: Clean Architecture and CQRS**
 - Dependency Inversion and Clean Architecture Layers
 - Command Query Responsibility Segregation (CQRS) with MediatR
 - Vertical Slice Architecture
 - The Outbox Pattern and Domain Events
 - *Case Study:* EV Reservation State Transitions
 
-**Chapter 13: Data Access: EF Core and Dapper**
+**Chapter 14: Data Access: EF Core and Dapper**
 - EF Core Change Tracker and Query Translation
 - Dapper: Bare-Metal Performance Mapping
 - Connection Pooling and Distributed Caching (Redis)
 - *Case Study:* Optimizing Tenant-Specific Queries
 
-**Chapter 14: Building Cloud-Native SaaS**
+**Chapter 15: Building Cloud-Native SaaS**
 - Multi-Tenancy Strategies (Row-Level vs. Schema vs. Database)
 - Resiliency Patterns (Retry, Circuit Breaker, Polly)
 - Distributed Tracing and Logging (OpenTelemetry)
