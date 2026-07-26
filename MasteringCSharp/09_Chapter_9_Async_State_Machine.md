@@ -192,7 +192,139 @@ If we have 5,000 chargers starting transactions at the exact same millisecond, t
 | Senior | Returning `Task` instead of `ValueTask` for cached data lookups. | High GC pressure from State Machine heap allocations. | Use `ValueTask` on hot-path methods that frequently complete synchronously. |
 | Architect | Wrapping CPU-bound work in `Task.Run()` on ASP.NET Core servers. | Steals threads from the Thread Pool that should be serving HTTP requests. | Do not use `Task.Run` on web servers. Process CPU work synchronously or offload to background queues (RabbitMQ). |
 
-## 10. Summary
+## 10. Interview Questions
+
+### Beginner Tier (Async/Await Basics)
+
+**1. What does the `await` keyword do in C#?**
+*Answer:* The `await` keyword suspends the execution of the async method until the awaited task completes. Critically, it *does not block* the calling thread. It returns the thread to the ThreadPool so it can handle other work while waiting.
+
+**2. What happens if you use `async` on a method but never use `await` inside it?**
+*Answer:* The compiler will issue a warning. The method will run synchronously on the calling thread, exactly as if the `async` keyword wasn't there.
+
+**3. What is the difference between CPU-bound and I/O-bound operations?**
+*Answer:* CPU-bound operations require intense processor calculations (e.g., calculating Pi, parsing massive JSON). I/O-bound operations require waiting for external hardware (e.g., database queries, HTTP requests, reading a file). `async/await` is designed for I/O-bound operations.
+
+**4. Why is it dangerous to use `.Result` or `.Wait()` on a Task?**
+*Answer:* It synchronously blocks the current thread until the Task completes. In UI applications or older ASP.NET environments with a Synchronization Context, this frequently causes immediate Deadlocks. Even in modern ASP.NET Core, it causes ThreadPool Starvation, drastically reducing scalability.
+
+**5. What is the purpose of `Task.Delay()`?**
+*Answer:* It creates an asynchronous delay (a timer). Unlike `Thread.Sleep()`, which blocks and paralyzes the thread, `Task.Delay()` releases the thread back to the pool and resumes the method after the specified time.
+
+**6. Can constructors be `async`?**
+*Answer:* No. Object instantiation must be synchronous. If you need asynchronous initialization, you should use an asynchronous factory method pattern (e.g., `public static async Task<MyClass> CreateAsync()`).
+
+**7. Can you use `await` inside a `catch` block?**
+*Answer:* Yes, starting from C# 6.0, you can use `await` inside `catch` and `finally` blocks, which is crucial for asynchronous logging or cleanup.
+
+### Intermediate Tier (Task Management and Cancellation)
+
+**8. Explain the danger of `async void`.**
+*Answer:* An `async` method should always return a `Task`. If an exception is thrown inside an `async void` method, it cannot be caught by the caller because there is no `Task` object. The exception is thrown directly onto the SynchronizationContext or ThreadPool, crashing the entire application process unconditionally. The only valid use case is a UI event handler.
+
+**9. How do you execute multiple tasks concurrently?**
+*Answer:* Start the tasks without awaiting them immediately, store them in a list, and then use `await Task.WhenAll()`.
+*Example:*
+```csharp
+var task1 = GetDbDataAsync();
+var task2 = GetApiDataAsync();
+await Task.WhenAll(task1, task2); // Runs concurrently
+```
+
+**10. What is a `CancellationToken`?**
+*Answer:* It is a struct passed into async methods to signal that the operation should be aborted (e.g., if the user clicks "Cancel" or an HTTP request times out). Deep inside the API, it calls `token.ThrowIfCancellationRequested()`.
+
+**11. How do you implement a timeout for an asynchronous method?**
+*Answer:* Use a `CancellationTokenSource` with a timeout.
+*Example:*
+```csharp
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+await httpClient.GetAsync(url, cts.Token);
+```
+
+**12. What is `Task.Run` used for?**
+*Answer:* It queues a specified workload to run on a background ThreadPool thread. It should be used to offload heavy CPU-bound work from the UI thread so the UI remains responsive.
+
+**13. Why should you NOT use `Task.Run` in an ASP.NET Core web application?**
+*Answer:* A web server's scalability relies on the ThreadPool having free threads to serve incoming HTTP requests. If you use `Task.Run` for CPU-bound work, you steal a thread from the ThreadPool, reducing the server's capacity. Just do the CPU work synchronously; it blocks a thread either way.
+
+**14. What does `Task.Yield()` do?**
+*Answer:* It forces the async method to immediately return the current thread to the ThreadPool and queue the continuation of the method as a new work item. It is sometimes used to break up extremely long synchronous operations to allow other queued tasks a chance to execute (cooperative multitasking).
+
+### Senior Tier (State Machines and ValueTask)
+
+**15. Explain exactly how `async/await` interacts with the OS via I/O Completion Ports (IOCP).**
+*Answer:* When you `await` network I/O, the CLR registers the socket with the Windows IOCP (or epoll on Linux). The thread is released back to the ThreadPool. When the network card finishes, the OS notifies IOCP, which queues a work item to the .NET ThreadPool, and a thread (often a different one) resumes the C# state machine.
+
+**16. What is the difference between `Task` and `ValueTask`?**
+*Answer:* `Task` is a reference type allocated on the managed heap. `ValueTask` is a `struct`. Returning a `Task` always causes a heap allocation. Returning `ValueTask` avoids this allocation if the method completes synchronously.
+
+**17. When should you use `ValueTask`?**
+*Answer:* When an asynchronous method is called very frequently in a hot path AND it frequently completes synchronously (e.g., retrieving data from an in-memory cache, and only occasionally performing an actual network `await`).
+
+**18. What are the strict rules for consuming a `ValueTask`?**
+*Answer:* You must `await` it exactly once. You cannot await it multiple times, you cannot call `.Result` or `.GetAwaiter().GetResult()` on it, and you cannot store it in a variable for later use. If you need to do these things, call `.AsTask()` to convert it to a heap-allocated `Task`.
+
+**19. What does the Roslyn compiler generate when it sees the `async` keyword?**
+*Answer:* It completely rewrites the method into a private `struct` that implements `IAsyncStateMachine`. It hoists local variables into fields on the struct, uses a `switch` statement based on an integer state variable to handle continuations, and wires up an `AsyncTaskMethodBuilder` to manage the resulting `Task`.
+
+**20. What is `Task.FromResult<T>()`?**
+*Answer:* It creates an already-completed `Task` holding the specified value. It is used when you must implement an interface that returns a `Task`, but your specific implementation is entirely synchronous.
+
+**21. Why does an async state machine cause Heap allocations even if it's a `struct`?**
+*Answer:* While the Roslyn-generated state machine is a `struct` (to avoid allocation on synchronous completion), the moment the method hits an actual `await` that yields, the CLR must box that struct onto the Heap so that the state survives while the current thread exits the method.
+
+### Staff Engineer Tier (SynchronizationContext and ExecutionContext)
+
+**22. What is `ConfigureAwait(false)` and why is it used in libraries?**
+*Answer:* It tells the `await` infrastructure NOT to marshal the continuation back to the original `SynchronizationContext` (like the WPF UI thread). This prevents deadlocks when a consumer synchronously blocks on the task using `.Result`, and slightly improves performance by avoiding the marshal overhead.
+
+**23. Does ASP.NET Core have a `SynchronizationContext`?**
+*Answer:* No. Legacy ASP.NET (System.Web) did, which caused massive deadlock issues. ASP.NET Core removed it entirely. Therefore, using `ConfigureAwait(false)` in an ASP.NET Core application project is completely redundant (though still required for NuGet libraries that might be consumed by UI apps).
+
+**24. What is the `ExecutionContext`?**
+*Answer:* While the `SynchronizationContext` handles *where* the continuation runs (which thread), the `ExecutionContext` handles *ambient data* (like `AsyncLocal<T>`, security impersonation, and culture). When a thread yields and a different thread resumes, the CLR flows the `ExecutionContext` from the old thread to the new thread so ambient state isn't lost.
+
+**25. How do you pass contextual data (like a TraceID) deep into an async call stack without passing it as a parameter?**
+*Answer:* Use `AsyncLocal<T>`. It is the async-safe equivalent of `ThreadLocal<T>`. When you set a value in an `AsyncLocal`, it flows automatically through the `ExecutionContext` into all child asynchronous tasks, regardless of which physical thread they resume on.
+
+**26. Why should you avoid `async` methods in high-throughput serialization pipelines?**
+*Answer:* Even highly optimized async pipelines (using `ValueTask`) incur the overhead of `AsyncMethodBuilder` and state machine setup. In extreme high-throughput parsers (millions of operations per second), architect the stream reading to occur asynchronously, but ensure the actual parsing logic operates completely synchronously on `ReadOnlySpan<byte>` buffers.
+
+**27. What is "Sync-over-Async" and why is it an anti-pattern?**
+*Answer:* Calling `.Result` or `.GetAwaiter().GetResult()` on an asynchronous method. It blocks the calling thread, defeating the entire purpose of async. Under heavy load, the ThreadPool starves because all threads are blocked waiting for Tasks, preventing new threads from processing the network responses needed to complete those same Tasks.
+
+### Architect Tier (Extreme Concurrency and I/O Tuning)
+
+**28. You are building a high-frequency trading platform where latencies are measured in microseconds. Is `async/await` the right choice?**
+*Answer:* Generally, no. `async/await` provides massive scalability (handling 10,000 concurrent sockets with 10 threads), but inherently adds latency (state machine allocation, context switching, IOCP queuing takes microseconds). For an HFT system bound by raw CPU latency where you dedicate physical CPU cores to specific threads, synchronous, non-blocking polling (spin waits) directly against shared memory is faster.
+
+**29. Explain how Kestrel (ASP.NET Core Web Server) manages I/O efficiently.**
+*Answer:* Kestrel uses a combination of IOCP (or `epoll`), `System.IO.Pipelines`, and highly optimized Socket Transports. It multiplexes thousands of connections onto a small number of dedicated I/O threads. It reads data directly into pinned `MemoryPool<byte>` buffers and parses HTTP requests synchronously using `Span<T>` before finally dispatching the completed request to the ASP.NET Core ThreadPool for business logic processing.
+
+**30. What is `IAsyncDisposable` and when is it required?**
+*Answer:* Introduced in C# 8, it allows objects to clean up unmanaged resources asynchronously (`await using var x = new Db()`). It is required when the cleanup process itself requires network I/O (e.g., sending a "Logout" packet to a database server before closing the TCP socket).
+
+**31. How do you implement a concurrency limiter for external API calls?**
+*Answer:* Do not use `lock` (it cannot be used across `await`). Use a `SemaphoreSlim`.
+*Example:*
+```csharp
+private static readonly SemaphoreSlim _semaphore = new SemaphoreSlim(5); // Max 5 concurrent
+await _semaphore.WaitAsync();
+try { await CallApiAsync(); }
+finally { _semaphore.Release(); }
+```
+
+**32. What is `System.Threading.Channels` and how does it compare to `BufferBlock` or `ConcurrentQueue`?**
+*Answer:* `Channels` provide a modern, highly optimized, async-aware Producer/Consumer queue. Unlike `ConcurrentQueue`, consumers can asynchronously `await channel.Reader.ReadAsync()` without active polling. Unlike TPL Dataflow (`BufferBlock`), Channels are vastly lighter weight, generating significantly less garbage and executing faster in high-throughput pub/sub scenarios.
+
+**33. How does `TaskCompletionSource<T>` allow you to wrap legacy Event-based APIs into modern `awaitable` Tasks?**
+*Answer:* It creates a "Promise" Task that you manually control. You return `tcs.Task` to the caller. When the legacy API fires its completion event, your event handler calls `tcs.SetResult(value)`, which marks the Task as complete and resumes the caller's `await` state machine.
+
+**34. Explain the ThreadPool starvation mitigation mechanism in .NET.**
+*Answer:* The .NET ThreadPool uses a hill-climbing algorithm to dynamically adjust thread counts. If it detects that all threads are blocked (e.g., due to sync-over-async abuse) and work items are queued, it will slowly inject new threads (approx 1-2 per second) to unblock the system. This delay protects the CPU from thrashing but causes massive latency spikes (the "burst" problem) in APIs suffering from thread starvation.
+
+## 11. Summary
 Asynchronous programming in C# is not about making code run faster; it is about **Scalability**. By allowing the compiler to rewrite our methods into I/O-aware State Machines, we free our threads to do actual work rather than waiting on network packets. We have mastered the difference between I/O-bound (`async`) and CPU-bound code, and protected our applications from thread starvation and GC pressure using `ValueTask`.
 
 In the next chapter, we look at the inverse problem: when you *actually* have heavy CPU work to do, how do you manage raw Threads, Concurrency, and Synchronization safely?

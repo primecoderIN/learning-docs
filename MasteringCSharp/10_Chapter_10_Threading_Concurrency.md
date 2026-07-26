@@ -161,7 +161,129 @@ public class TelemetryPipeline
 | Senior | Locking on `typeof(MyClass)` or `this`. | Unpredictable cross-component deadlocks. | Always instantiate a private, dedicated `object` for synchronization locking. |
 | Architect | Unbounded Queues in a Producer/Consumer pattern. | Memory Leaks. If writing to the DB is slow, the queue will grow until the server hits an OutOfMemoryException. | Use Bounded Channels. Apply backpressure so producers slow down if the queue is full. |
 
-## 9. Summary
+## 9. Interview Questions
+
+### Beginner Tier (Threading Basics and OS)
+
+**1. What is a Thread in C#?**
+*Answer:* A Thread is an execution path that can run concurrently with other threads within a single process. Every application starts with a Main Thread.
+
+**2. What is the .NET ThreadPool and why is it used instead of creating new Threads manually?**
+*Answer:* Creating an OS thread is expensive (1MB stack allocation, kernel object creation). The ThreadPool maintains a pool of already-created worker threads. Instead of creating a new thread, `Task.Run` borrows a thread from the pool, uses it, and returns it, preventing memory exhaustion and context-switching overhead.
+
+**3. What is a Context Switch?**
+*Answer:* A Context Switch is the process where the OS Scheduler pauses one thread, saves its CPU registers and state to memory, loads the state of a different thread, and resumes it on the CPU core. It is an expensive operation that degrades performance if it happens too frequently.
+
+**4. What is Thread Starvation?**
+*Answer:* Thread Starvation occurs when all ThreadPool threads are busy or blocked (e.g., waiting synchronously on I/O or deadlocked), and no threads are available to process new incoming work. The application becomes unresponsive.
+
+**5. What is a Race Condition?**
+*Answer:* A race condition occurs when two or more threads access shared memory concurrently, and at least one thread modifies it. Because thread execution order is non-deterministic (controlled by the OS scheduler), the final state of the data is corrupted and unpredictable.
+
+**6. What does the `lock` statement do?**
+*Answer:* The `lock` statement ensures that only one thread can execute a block of code at a time. It prevents race conditions on shared resources.
+*Example:*
+```csharp
+lock (_syncRoot) { _counter++; }
+```
+
+**7. Why should you NOT lock on `this` or a `string`?**
+*Answer:* Because `this` and interned strings are publicly accessible from outside the class. If external code also locks on that same reference, you will cause an unexpected Deadlock. Always create a `private readonly object _syncObject = new object();`.
+
+### Intermediate Tier (Synchronization Primitives)
+
+**8. What does `Monitor.Enter()` do?**
+*Answer:* The `lock` keyword is syntax sugar for `Monitor.Enter()`. It attempts to acquire an exclusive lock on an object's SyncBlock. If another thread holds the lock, the current thread is blocked by the OS until the lock is released via `Monitor.Exit()`.
+
+**9. What is a Deadlock?**
+*Answer:* A Deadlock occurs when Thread A holds Lock 1 and waits for Lock 2, while Thread B holds Lock 2 and waits for Lock 1. Both threads are blocked infinitely, and the application freezes.
+
+**10. How does a `Mutex` differ from `lock` (`Monitor`)?**
+*Answer:* `Monitor` only works within a single application process (intra-process). A `Mutex` is an OS-level primitive that can synchronize threads across entirely different applications running on the same machine (inter-process). However, `Mutex` is significantly slower due to the kernel transition.
+
+**11. What is a `SemaphoreSlim`?**
+*Answer:* It is a lightweight synchronization primitive that limits the number of threads that can access a resource concurrently. Unlike `lock` (which allows 1 thread), a Semaphore can allow N threads (e.g., max 5 concurrent database connections).
+
+**12. Why must you use `SemaphoreSlim` instead of `lock` inside `async` methods?**
+*Answer:* The `lock` statement is thread-affine (the thread that acquires it must release it). In an `async` method, an `await` yields the thread, and a completely different thread might resume execution. Trying to unlock from a different thread throws a `SynchronizationLockException`. `SemaphoreSlim.WaitAsync()` is not thread-affine and is safe for async code.
+
+**13. What is `Interlocked.Increment()`?**
+*Answer:* It provides a lock-free, atomic increment operation natively supported by the CPU hardware. It is vastly faster than using a `lock` block just to increment an integer counter.
+*Example:*
+```csharp
+Interlocked.Increment(ref _counter);
+```
+
+**14. What are Concurrent Collections?**
+*Answer:* Collections in `System.Collections.Concurrent` (like `ConcurrentDictionary`, `ConcurrentQueue`) designed for safe access by multiple threads simultaneously. They use fine-grained locking or lock-free algorithms, preventing the crashes you get when modifying a standard `Dictionary` concurrently.
+
+### Senior Tier (Thread Safety and Hardware)
+
+**15. Explain the `volatile` keyword.**
+*Answer:* The CPU caches memory heavily in L1/L2 caches. If Thread A updates a boolean flag, Thread B (on a different CPU core) might not see the update because it reads from its own stale cache. The `volatile` keyword prevents the CPU from caching the variable and prevents the JIT compiler from reordering read/write instructions around it, ensuring all threads see the most up-to-date value.
+
+**16. What is False Sharing?**
+*Answer:* The CPU reads memory in "Cache Lines" (typically 64 bytes). If Thread A updates Variable X, and Thread B updates Variable Y, and X and Y happen to sit next to each other in the same 64-byte block, the hardware forces cache invalidations across CPU cores, destroying performance even though the threads are modifying different variables.
+
+**17. What is a `ReaderWriterLockSlim`?**
+*Answer:* A synchronization lock designed for scenarios where reads are frequent but writes are rare. It allows multiple threads to read the data concurrently (no locking overhead), but when a thread needs to write, it blocks all new readers and waits for existing readers to finish, ensuring exclusive write access.
+
+**18. Explain the Work Stealing algorithm in the .NET ThreadPool.**
+*Answer:* To minimize lock contention on the global work queue, every ThreadPool thread has its own Local Queue. If a thread finishes its local queue, instead of waiting, it looks at another thread's local queue and "steals" a task from the tail end of it (using a lock-free algorithm). This maximizes CPU utilization across all cores.
+
+**19. How does `TaskCompletionSource` help with bridging synchronous threading models to async?**
+*Answer:* It allows you to create an uncompleted `Task`. You can hand this `Task` to an `await`er, and then spin off a raw legacy Thread (or handle a hardware interrupt). When the legacy thread finishes its work, it calls `tcs.SetResult()`, which safely transitions the `Task` to a completed state and resumes the awaiter.
+
+**20. What is Thread Affinity?**
+*Answer:* Thread Affinity is the requirement that a specific operation must execute on a specific physical thread. The most common example is UI frameworks (WPF, WinForms), where UI controls can only be updated by the exact thread that created them (the Main UI Thread).
+
+**21. What happens if you call `Thread.Abort()`?**
+*Answer:* `Thread.Abort()` throws a `ThreadAbortException` unconditionally in the target thread, often in the middle of executing finally blocks or updating shared state. It corrupts application state permanently. It is so dangerous that Microsoft completely removed it in .NET Core (it throws `PlatformNotSupportedException`). Use `CancellationToken` instead.
+
+### Staff Engineer Tier (Lock-Free and Parallelism)
+
+**22. How do you implement a lock-free algorithm using `Interlocked.CompareExchange` (CAS)?**
+*Answer:* Compare-And-Swap (CAS) is a hardware instruction. You read the current state, calculate the new state, and call `CompareExchange`. If the current state hasn't changed since you read it, the swap succeeds. If another thread modified it, the swap fails, and you loop back to try again (a Spin Wait). This avoids OS lock suspensions entirely.
+
+**23. What is the difference between Concurrency and Parallelism?**
+*Answer:* Concurrency is about *dealing* with multiple things at once (e.g., one thread switching between 5 different tasks using async/await). Parallelism is about *doing* multiple things at once (e.g., using 4 physical CPU cores to calculate 4 different math equations simultaneously using `Parallel.ForEach`).
+
+**24. When should you use `Parallel.ForEach` vs `Task.Run`?**
+*Answer:* `Task.Run` queues a single unit of work to the ThreadPool. `Parallel.ForEach` takes a large collection of items and efficiently partitions them across all available CPU cores, managing the ThreadPool workers for you to achieve maximum data parallelism for CPU-bound loops.
+
+**25. Why might `Parallel.ForEach` perform worse than a standard `foreach` loop?**
+*Answer:* Parallelism introduces overhead (partitioning data, synchronizing threads, merging results). If the work done inside the loop is very fast (e.g., adding two numbers), the overhead of coordinating the threads will take longer than just doing the math synchronously on a single thread. Parallelism is only for heavy CPU-bound loop bodies.
+
+**26. What is PLINQ (`.AsParallel()`) and what are its dangers?**
+*Answer:* PLINQ allows LINQ queries to execute in parallel across multiple cores. However, by default, the output order is non-deterministic (it does not preserve the input order). Also, executing multiple PLINQ queries concurrently on a web server will starve the ThreadPool and crush request throughput.
+
+**27. Explain the `ThreadLocal<T>` class.**
+*Answer:* It provides storage for data that is unique to the current thread. It is used to prevent thread contention. For example, instead of locking a shared `Random` instance, you can use `ThreadLocal<Random>` so every thread has its own instance and generates numbers without locking.
+
+### Architect Tier (High-Throughput Pipelines)
+
+**28. You have an ingestion API receiving 50,000 JSON payloads per second. Writing them directly to SQL Server crashes the database. How do you architect a solution?**
+*Answer:* I would implement an asynchronous Producer-Consumer pipeline using `System.Threading.Channels`. The API endpoints act as fast Producers, writing payloads into a `BoundedChannel` (which provides backpressure if the queue gets full). A single background service acts as the Consumer, reading batches of payloads using `ReadAllAsync` and executing bulk SQL inserts (`SqlBulkCopy`), protecting the database.
+
+**29. What is Backpressure, and how does `BoundedChannelFullMode.Wait` implement it?**
+*Answer:* Backpressure is a system's way of telling upstream callers to slow down. If producers enqueue data faster than consumers can process it, an Unbounded queue will grow until the server OOMs. A Bounded Channel has a limit. When full, `WriteAsync` simply *suspends* the producer thread (via await) until the consumer frees up space, safely propagating the delay back to the HTTP client (e.g., returning 429 Too Many Requests or throttling the TCP socket).
+
+**30. Why is `System.Threading.Channels` superior to `BlockingCollection<T>` for modern C# apps?**
+*Answer:* `BlockingCollection` was designed before `async/await`. When the collection is empty, a consumer calling `.Take()` synchronously blocks the physical OS thread, wasting 1MB of memory and a core. `Channels` use `await foreach (var item in channel.Reader.ReadAllAsync())`, which yields the thread asynchronously when empty, achieving vastly higher scalability.
+
+**31. How do you avoid the "Thundering Herd" problem when caching database lookups?**
+*Answer:* If a cache expires, 100 concurrent threads might all miss the cache simultaneously and query the database at the same exact millisecond, crushing it. You must use `SemaphoreSlim` or `Lazy<Task<T>>` combined with a `ConcurrentDictionary` to ensure only the *first* thread executes the DB query, while the other 99 threads await the result of that single in-flight task.
+
+**32. What is a SpinLock and when is it appropriate?**
+*Answer:* A `SpinLock` does not yield the thread to the OS when blocked. It aggressively loops on the CPU checking the lock state. It should ONLY be used for extremely short critical sections (e.g., updating a few pointers) where the cost of a Context Switch (microseconds) is worse than wasting CPU cycles spinning (nanoseconds). If used incorrectly, it causes CPU core starvation.
+
+**33. How does the .NET ThreadPool's "Hill Climbing" algorithm affect API latency?**
+*Answer:* When threads are blocked (e.g., synchronous DB calls), the ThreadPool slowly injects new threads (1-2 per second) to unblock the system, probing to see if throughput improves. This slow injection causes massive latency spikes (the "burst" problem) under sudden high load. Architects must either eliminate blocking calls or manually increase `ThreadPool.SetMinThreads()` to handle bursts.
+
+**34. Explain the Actor Model (e.g., Akka.NET or Orleans) and why it replaces traditional Locking.**
+*Answer:* Traditional locking (mutexes) scales poorly across distributed systems and multi-core architectures due to contention. The Actor Model encapsulates state within "Actors". Each Actor has an inbox (a queue) and processes messages strictly sequentially on a single logical thread. By passing immutable messages between Actors instead of sharing memory, the need for `lock` is entirely eliminated, allowing massive, lock-free, distributed scalability.
+
+## 10. Summary
 Concurrency is dangerous. We have seen how raw OS threads consume physical resources and how the .NET ThreadPool abstracts this away using Work Stealing. By leveraging `SemaphoreSlim` for asynchronous synchronization and `System.Threading.Channels` for lock-free producer/consumer pipelines, we can architect systems that process millions of records without corrupting shared memory or blocking the CPU.
 
 In the next chapter, we move into the final frontier: Enterprise Architecture. We will explore how ASP.NET Core wires all these concepts together to process HTTP requests using Kestrel and Dependency Injection.

@@ -222,7 +222,182 @@ namespace EVPlatform.Domain
 | Senior | Deep Inheritance Hierarchies (>3 levels). | Brittle architecture, impossible to unit test effectively. | Favor Composition over Inheritance. Extract shared behavior into interfaces or composed dependencies. |
 | Architect | Virtual Dispatch in high-throughput parsing loops. | CPU stall and cache misses. | Use sealed classes, static methods, or generic constraints (`where T : IParser`) which the JIT can devirtualize. |
 
-## 8. Summary
+## 8. Interview Questions
+
+### Beginner Tier (OOP Fundamentals)
+
+**1. What is Polymorphism?**
+*Answer:* Polymorphism means "many shapes." It allows a method to accept a base class (like `Animal`) or interface, but execute the specific, overridden behavior of the concrete derived class (like `Dog.Speak()`) at runtime.
+
+**2. What is the difference between `abstract` and `virtual` methods?**
+*Answer:* A `virtual` method provides a default implementation that a derived class *can* override. An `abstract` method has no implementation; it forces the derived class to provide the implementation. `abstract` methods can only exist in `abstract` classes.
+*Example:*
+```csharp
+abstract class Base {
+    public virtual void Opt() { /* Default code */ }
+    public abstract void Req(); // Must be implemented
+}
+```
+
+**3. Can a class inherit from multiple classes?**
+*Answer:* No. C# does not support multiple inheritance for classes to avoid the "Diamond Problem" (ambiguity in which base method to call). However, a class can implement multiple interfaces.
+
+**4. What does the `sealed` keyword do?**
+*Answer:* When applied to a class, it prevents any other class from inheriting from it. When applied to an overridden method, it prevents further derived classes from overriding that specific method.
+*Example:*
+```csharp
+sealed class SecuritySystem { } // Cannot be inherited
+```
+
+**5. What is the `base` keyword?**
+*Answer:* The `base` keyword is used to access members (methods, properties, or constructors) of the base class from within a derived class.
+*Example:*
+```csharp
+class Child : Parent {
+    public Child() : base("Param") { } // Calls Parent constructor
+}
+```
+
+**6. Explain method overloading vs method overriding.**
+*Answer:* Overloading is compile-time polymorphism: having multiple methods with the same name but different parameters in the same class. Overriding is runtime polymorphism: changing the behavior of a base class's `virtual` method in a derived class using the `override` keyword.
+
+**7. What is an Interface?**
+*Answer:* An interface is a contract. It defines a set of methods, properties, or events without any implementation (prior to C# 8 default implementations). Any class that implements the interface must provide the code for those members.
+
+### Intermediate Tier (Records and Pattern Matching)
+
+**8. Explain the difference between a `class` and a `record`.**
+*Answer:* A `class` uses reference equality by default (two objects are only equal if they point to the exact same memory address). A `record` is a reference type where the compiler automatically generates value-based equality methods. Two records are equal if all their properties contain the same values.
+
+**9. What is a Primary Constructor in a record?**
+*Answer:* A concise syntax for declaring a record and its properties on a single line. The compiler automatically generates `init`-only properties for each parameter.
+*Example:*
+```csharp
+public record User(string Name, int Age); 
+```
+
+**10. How do you mutate a `record`?**
+*Answer:* You don't mutate the original record because its properties are usually `init`-only. You use the `with` expression to create a new, distinct copy of the record with specific properties altered.
+*Example:*
+```csharp
+var u1 = new User("Alice", 30);
+var u2 = u1 with { Age = 31 }; // u1 is unchanged
+```
+
+**11. What is the `is` operator used for in Pattern Matching?**
+*Answer:* It checks if an object is compatible with a specific type. In modern C#, it can also assign the casted value to a new variable in one step.
+*Example:*
+```csharp
+if (obj is string s) {
+    Console.WriteLine(s.Length); // 's' is strongly typed
+}
+```
+
+**12. Show a `switch` expression using Property Pattern Matching.**
+*Answer:* You can inspect the properties of an object directly inside the switch arms.
+*Example:*
+```csharp
+string status = user switch {
+    { Age: < 18 } => "Minor",
+    { IsAdmin: true } => "Admin",
+    _ => "Standard"
+};
+```
+
+**13. What is a Positional Pattern?**
+*Answer:* If a type (like a tuple or a record) has a `Deconstruct` method, you can pattern match against the deconstructed values directly.
+*Example:*
+```csharp
+string result = point switch {
+    (0, 0) => "Origin",
+    (var x, var y) when x == y => "Diagonal",
+    _ => "Other"
+};
+```
+
+**14. What does the `new()` constraint do in Generics?**
+*Answer:* It forces the generic type parameter to have a public, parameterless constructor, allowing you to instantiate it inside the generic class.
+*Example:*
+```csharp
+class Factory<T> where T : new() {
+    public T Create() => new T();
+}
+```
+
+### Senior Tier (VTable and Dispatch)
+
+**15. How does Virtual Method Dispatch work under the hood?**
+*Answer:* The compiler emits a `callvirt` IL instruction. At runtime, the JIT uses the object's hidden MethodTable pointer to find the Virtual Method Table (VTable). It looks up the specific slot for the overridden method and jumps to that memory address. This pointer indirection prevents inlining.
+
+**16. Why does `callvirt` always include a Null Check?**
+*Answer:* Because dynamic dispatch relies on reading the MethodTable pointer located on the object instance in the heap. If the object reference is `null`, there is no MethodTable to read, and the CLR must throw a `NullReferenceException`. Static `call` instructions do not need the object instance to figure out the method address.
+
+**17. What is Interface Dispatch, and why is it slower than Virtual Dispatch?**
+*Answer:* Virtual dispatch looks up a slot in a fixed, linear VTable. Interface dispatch is more complex because a class can implement multiple interfaces, and the method might not be in the same VTable slot for different classes implementing the same interface. The CLR must search an interface map (Virtual Stub Dispatch), which requires slightly more CPU overhead.
+
+**18. What is Method Hiding (the `new` keyword on methods)?**
+*Answer:* If a derived class declares a method with the same name as a base class method, but uses `new` instead of `override`, it hides the base method. It does *not* participate in polymorphism. The method executed depends on the *compile-time* type of the variable, not the runtime type.
+*Example:*
+```csharp
+class A { public void Go() {} }
+class B : A { public new void Go() {} }
+A obj = new B();
+obj.Go(); // Calls A.Go()!
+```
+
+**19. How do Default Interface Methods (C# 8) impact architecture?**
+*Answer:* They allow you to add new methods with implementations to an existing interface without breaking backward compatibility for classes that already implement the interface. It enables trait-like behavior but complicates multiple inheritance scenarios.
+
+**20. What is Covariance and Contravariance?**
+*Answer:* They allow implicit reference conversions for generic interfaces. Covariance (`out T`) allows a method to return a more derived type (e.g., returning a `Dog` when an `IEnumerable<Animal>` is expected). Contravariance (`in T`) allows a method to accept a less derived type (e.g., passing an `IComparer<Animal>` to sort a list of `Dog`s).
+
+**21. Explain the "Fragile Base Class" problem.**
+*Answer:* In deep inheritance hierarchies, changing a seemingly isolated method in a base class can have catastrophic, unforeseen side effects in derived classes that rely on the base class's internal state. This is why architects prefer Composition over Inheritance.
+
+### Staff Engineer Tier (Compiler Internals and DDD)
+
+**22. How does C# pattern matching (e.g., `switch` expressions) compile down into IL?**
+*Answer:* Depending on complexity, Roslyn may emit a series of `isinst` (Is Instance) checks followed by conditional branches. If matching against a known closed hierarchy or specific constants, it optimizes it into IL jump tables or binary searches. It is vastly more efficient than manual `if (obj.GetType() == typeof(X))` chains.
+
+**23. What is an exhaustive `switch` expression?**
+*Answer:* The compiler analyzes the type being switched on. If it's an `enum`, `bool`, or a closed inheritance hierarchy (like a discriminated union approximation), the compiler guarantees that every possible state is handled. If a state is missed, it throws a compile-time warning (CS8509).
+
+**24. When applying Domain-Driven Design (DDD), how do you decide whether a concept should be an Entity or a Value Object?**
+*Answer:* An Entity has a distinct identity that persists over time, even if its properties change (e.g., a `User` changing their name). A Value Object has no conceptual identity; it is defined entirely by its attributes (e.g., a `Money` amount). In C#, Entities are typically encapsulated `class` types, while Value Objects are perfectly modeled as immutable `record` types.
+
+**25. Why are ORMs like EF Core problematic with C# `record` types?**
+*Answer:* EF Core Change Tracking relies heavily on object identity (reference equality) and mutability to track which fields were updated. Because records use value equality and are usually immutable (requiring `with` expressions to generate new instances), the ORM loses track of the object instance, making updates difficult or impossible without complex workarounds.
+
+**26. How do you enforce invariants in a DDD Entity without exposing setters?**
+*Answer:* You make all property setters `private` or `init`. State changes are only permitted through explicitly named business methods (e.g., `order.ApplyDiscount(10)`) that validate the input and throw exceptions if the invariant is violated, ensuring the object is never put into an invalid state.
+
+**27. Explain the performance impact of Devirtualization.**
+*Answer:* Devirtualization is a JIT optimization. If the JIT proves that a class is `sealed`, or that an interface method only has one concrete implementer at runtime, it replaces the expensive `callvirt` (VTable lookup) with a direct `call`. This eliminates pointer indirection and allows the method to be completely inlined into the caller.
+
+### Architect Tier (Extreme Architecture and JIT Tricks)
+
+**28. Virtual Dispatch in high-throughput parsing loops causes CPU stalls. How do you architect around this?**
+*Answer:* Use "Constrained Generics" for static polymorphism. Instead of `public void Parse(IParser p)`, use `public void Parse<T>(T p) where T : IParser`. The JIT compiles a specialized, separate native code path for every struct passed as `T`. This completely devirtualizes the interface call, eliminating the VTable lookup and allowing the JIT to inline the parsing logic, achieving C++ speeds.
+
+**29. What is the difference between an Anemic Domain Model and a Rich Domain Model?**
+*Answer:* An Anemic Domain Model is an anti-pattern where Entities are just bags of public getters and setters (data), and separate "Service" classes contain all the logic. This violates OOP encapsulation. A Rich Domain Model places the business logic directly inside the Entity itself, protecting its own invariants and state.
+
+**30. How do you emulate Discriminated Unions in C# using Pattern Matching?**
+*Answer:* C# does not have native F#-style Discriminated Unions yet. Architects emulate them using an `abstract record` base class with a `private protected` constructor, ensuring no external classes can inherit from it. Then, declare the derived `record` types nested inside or in the same file. This creates a "closed" hierarchy that `switch` expressions can exhaustively match against.
+
+**31. Explain the architectural implications of the `InternalsVisibleTo` attribute.**
+*Answer:* To build true microservice boundaries within a monolith (Modular Monolith), the Core Domain should be marked `internal` so the API layer cannot accidentally bypass Application Services and mutate entities directly. `InternalsVisibleTo` is then used exclusively to allow the Unit Test project to bypass this boundary for testing.
+
+**32. Why would an architect forbid the use of `dynamic` in an enterprise C# application?**
+*Answer:* The `dynamic` keyword bypasses compile-time type checking and relies on the DLR (Dynamic Language Runtime) to resolve method calls at runtime. This requires heavy reflection, boxing, and caching mechanisms. It breaks static analysis, prevents JIT optimizations, causes severe performance penalties, and masks runtime crashes that should have been caught at compile time.
+
+**33. How does the Liskov Substitution Principle (LSP) constrain your inheritance architecture?**
+*Answer:* LSP dictates that a derived class must be seamlessly substitutable for its base class. If a consumer calls `bird.Fly()`, and the injected object is a `Penguin` that throws a `NotSupportedException`, LSP is violated. The architect must restructure the taxonomy, extracting a specific `IFlyingBird` interface rather than forcing a monolithic base class.
+
+**34. What is the Expression Problem, and how do OOP and FP address it differently in C#?**
+*Answer:* The Expression Problem is the challenge of extending a system in two dimensions: adding new Data Types or adding new Operations. OOP makes it easy to add new Data Types (just create a new derived class) but hard to add new Operations (must modify the base class and all derived classes). FP (Pattern Matching) makes it easy to add Operations (write a new `switch` statement) but hard to add new Data Types (must update every `switch` statement). A C# architect must choose the right paradigm based on which dimension is more likely to change.
+
+## 9. Summary
 Modern C# is a hybrid language. It retains the deep architectural capabilities of Object-Oriented Programming (Classes, Polymorphism, Encapsulation) while embracing the safety and predictability of Functional Programming (Records, Immutability, Pattern Matching). 
 
 As an architect, your job is to apply these tools correctly: use standard classes for rich domain entities that mutate over time, and use records/pattern matching for the data passing between the boundaries of your system. In the next chapter, we will explore Delegates, Events, and the internal state machines that power LINQ.

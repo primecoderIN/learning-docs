@@ -183,7 +183,136 @@ public class SqlChargerRepository : IChargerRepository
 | Senior | Relying on EF Core for Bulk Updates. | Doing `foreach(var item in list) { item.Status = 1; } SaveChanges()` generates 10,000 separate `UPDATE` SQL statements. | Use `ExecuteUpdateAsync()` (EF Core 7+) or Dapper to execute a single `UPDATE ... WHERE IN (...)` statement. |
 | Architect | Ignoring SQL Indexes. | Table scans lock the DB. | Use EF Migrations or DBA scripts to ensure Foreign Keys and frequently queried columns are indexed. |
 
-## 9. Summary
+## 9. Interview Questions
+
+### Beginner Tier (EF Core Basics and Object-Relational Mapping)
+
+**1. What is an ORM?**
+*Answer:* Object-Relational Mapping (ORM) is a technique that lets you query and manipulate data from a database using an object-oriented paradigm. EF Core translates C# classes (Entities) into database tables and LINQ queries into SQL.
+
+**2. What is the `DbContext`?**
+*Answer:* The `DbContext` is the primary class in EF Core responsible for interacting with the database. It manages database connections, holds `DbSet<T>` properties for querying entities, and coordinates saving changes.
+
+**3. What is a `DbSet<T>`?**
+*Answer:* A property on the `DbContext` that represents a collection of all entities in the context, or that can be queried from the database, of a given type. It maps to a specific table in the database.
+
+**4. How do you execute a basic query in EF Core?**
+*Answer:* By writing a LINQ query against a `DbSet`.
+*Example:*
+```csharp
+var activeUsers = await _context.Users.Where(u => u.IsActive).ToListAsync();
+```
+
+**5. What is the difference between `IEnumerable` and `IQueryable` in EF Core?**
+*Answer:* `IEnumerable` executes the query immediately, pulls all data into RAM, and performs filtering on the client side. `IQueryable` builds an Expression Tree that EF Core translates into SQL, meaning the filtering happens on the database server before data is sent over the network.
+
+**6. How do you save a new record to the database?**
+*Answer:* You add the entity to the `DbSet` and call `SaveChangesAsync()`.
+*Example:*
+```csharp
+_context.Users.Add(newUser);
+await _context.SaveChangesAsync();
+```
+
+**7. What is a Primary Key in EF Core?**
+*Answer:* A property that uniquely identifies an entity instance. EF Core convention automatically assumes a property named `Id` or `<ClassName>Id` is the primary key.
+
+### Intermediate Tier (Change Tracking and Performance)
+
+**8. What is the Change Tracker?**
+*Answer:* An internal dictionary within the `DbContext` that keeps a snapshot of every entity you query from the database. When you call `SaveChanges()`, EF compares the current state of your objects to the snapshots to generate precise `UPDATE` or `DELETE` SQL statements.
+
+**9. Why is `.AsNoTracking()` faster in EF Core?**
+*Answer:* By default, EF Core stores a snapshot of every queried entity in the Change Tracker. `.AsNoTracking()` bypasses this, saving significant memory allocation and CPU cycles during materialization. It should be used for all read-only queries.
+
+**10. What is the N+1 Query Problem in Entity Framework?**
+*Answer:* It occurs when you query a list of parent entities (1 query) and then loop through them, lazy-loading a child entity for each parent (N queries). This crushes database performance.
+
+**11. How do you fix the N+1 Problem?**
+*Answer:* Fix it using Eager Loading via the `.Include()` method (which generates a SQL `JOIN`), or by using Projections via `.Select()` to fetch exactly the data you need in one query.
+
+**12. Explain Eager Loading vs. Lazy Loading.**
+*Answer:* Eager loading (`.Include()`) fetches related data from the database as part of the initial query. Lazy loading defers fetching related data until the navigation property is explicitly accessed in C#, which triggers a hidden, synchronous database query.
+
+**13. What is Client-Side Evaluation?**
+*Answer:* It occurs when EF Core cannot translate a C# LINQ method (like a custom method or unsupported string function) into SQL. In older versions of EF, it would fetch the entire table to RAM and filter it locally. Modern EF Core throws a runtime exception instead.
+
+**14. What are EF Core Migrations?**
+*Answer:* Migrations are a feature that keeps the database schema in sync with the C# model classes. When you change a class, you add a migration, and EF generates C# code representing the SQL `ALTER TABLE` commands needed to update the database.
+
+### Senior Tier (Dapper, Concurrency, and Transactions)
+
+**15. Why might a developer choose to use Dapper instead of EF Core for a specific query?**
+*Answer:* While EF Core provides excellent productivity and change tracking for Domain mutations, generating SQL from complex LINQ trees and materializing objects carries overhead. Dapper is a micro-ORM that executes raw SQL and maps the result directly to objects using lightweight dynamic methods. It offers absolute bare-metal speed for massive, multi-join read queries.
+
+**16. How do you prevent two users from updating the same record simultaneously in EF Core?**
+*Answer:* You use Optimistic Concurrency Control. You add a `byte[]` property decorated with `[Timestamp]` (or configure it as a Concurrency Token). When EF executes an `UPDATE`, it includes `WHERE Timestamp = @originalTimestamp`. If someone else modified the record, the timestamp won't match, 0 rows are updated, and EF throws a `DbUpdateConcurrencyException`.
+
+**17. How do you implement a Database Transaction in EF Core?**
+*Answer:* `SaveChangesAsync()` is inherently transactional (either all changes succeed or all fail). If you need to coordinate multiple `SaveChanges` calls or mix EF Core with Dapper, you manually begin a transaction.
+*Example:*
+```csharp
+using var transaction = await _context.Database.BeginTransactionAsync();
+try { /* logic */ await transaction.CommitAsync(); }
+catch { await transaction.RollbackAsync(); }
+```
+
+**18. Explain ADO.NET Connection Pooling. What happens if you forget to `Dispose()` an `SqlConnection`?**
+*Answer:* Connection Pooling keeps physical TCP connections to the database alive in RAM, sharing them among subsequent requests to avoid the extreme latency of creating TCP handshakes. If you forget to `Dispose()` (or use the `using` block), the connection is never returned to the pool. The pool empties, and the app crashes with a Timeout Exception.
+
+**19. What is a "Split Query" in EF Core (`.AsSplitQuery()`)?**
+*Answer:* When using `.Include()` on multiple collection navigation properties (e.g., getting a Tenant with all Users and all Invoices), EF Core generates a massive Cartesian explosion via SQL JOINs, returning gigabytes of duplicate data. `.AsSplitQuery()` forces EF to execute separate, lighter SQL queries for each collection and stitch them together in memory.
+
+**20. Explain the difference between `.FirstOrDefaultAsync()` and `.SingleOrDefaultAsync()`.**
+*Answer:* `FirstOrDefault` returns the first record it finds (adding `TOP 1` or `LIMIT 1` to the SQL) and ignores the rest. `SingleOrDefault` returns the record, but if the database contains *more than one* matching record, it throws an exception. `Single` is used when uniqueness is a strict business invariant.
+
+**21. How do you execute Raw SQL in modern EF Core?**
+*Answer:* Using `_context.Database.SqlQuery<T>($"SELECT * FROM ...")` or `.FromSqlRaw()`. You must be extremely careful to use string interpolation correctly with `.FromSqlInterpolated()` so that EF parameterizes the inputs to prevent SQL Injection.
+
+### Staff Engineer Tier (Advanced Patterns and Compilation)
+
+**22. You have an EF Core loop that updates the `Status` property of 10,000 records, calling `SaveChanges()` at the end. Why is this bad, and how do you fix it in modern .NET?**
+*Answer:* EF Core's Change Tracker will track 10,000 entities in RAM. `SaveChanges()` will generate 10,000 separate `UPDATE` SQL statements and execute them in a massive batch, choking the database transaction log. In .NET 7+, you should use `ExecuteUpdateAsync()` to execute a single, bulk `UPDATE table SET Status = X WHERE ...` directly against the database without ever pulling the entities into RAM.
+
+**23. What are Compiled Queries in EF Core?**
+*Answer:* Translating LINQ expression trees into SQL takes CPU time. For extreme high-throughput APIs, you can use `EF.CompileAsyncQuery()`. This parses the LINQ tree exactly once and returns a delegate. Subsequent executions use the cached delegate, bypassing the translation overhead entirely.
+
+**24. How do you map a C# property to a JSON column in PostgreSQL/SQL Server using EF Core?**
+*Answer:* In modern EF Core, you can map a complex C# object to a JSON column using `.OwnsOne()` and `.ToJson()` in the Fluent API. EF Core will automatically serialize/deserialize the object to a JSON string in the database column, and can even translate LINQ queries into database-specific JSON path queries.
+
+**25. How do you inject a Scoped `DbContext` into a Singleton Background Service safely?**
+*Answer:* You cannot inject it directly (Captive Dependency). You must inject the `IServiceScopeFactory`, call `.CreateScope()` inside the background service's `ExecuteAsync` loop, and resolve the `DbContext` from that explicit scope.
+
+**26. What is a Global Query Filter?**
+*Answer:* A LINQ filter applied directly in the `OnModelCreating` method that automatically appends a `WHERE` clause to *every* query against that entity. It is heavily used for Soft Deletes (e.g., `.HasQueryFilter(e => !e.IsDeleted)`) and Multi-Tenancy (filtering by `TenantId`).
+
+**27. Explain the Repository Pattern and why it is sometimes considered an anti-pattern when using EF Core.**
+*Answer:* The Repository Pattern abstracts data access behind an interface. Some architects argue it is an anti-pattern with EF Core because the `DbContext` *is already* a Unit of Work, and `DbSet` *is already* a Repository. Wrapping them in another layer of abstraction often just duplicates code and hides powerful EF Core features (like projections) without adding value.
+
+**28. How does Dapper map query results to C# objects so fast?**
+*Answer:* Dapper reads the SQL result set using `IDataReader`. It uses `Reflection` exactly once per type to map column names to C# properties. It then uses `System.Reflection.Emit` (IL Generation) to build a highly optimized, dynamic mapping method. It compiles this IL into a Delegate and caches it. Subsequent queries run at the speed of hand-written C# code.
+
+### Architect Tier (Resiliency, Sharding, and Eventual Consistency)
+
+**29. How do you handle transient database connection failures (e.g., Azure SQL failovers)?**
+*Answer:* Connections drop frequently in the cloud. You must configure Execution Strategies (e.g., `EnableRetryOnFailure()` in EF Core or Polly with Dapper). This intercepts `SqlException`s caused by transient network blips and automatically retries the query with exponential backoff before surfacing the error to the user.
+
+**30. How do you architect Multi-Tenancy at the database level?**
+*Answer:* 1. **Database-per-Tenant:** Maximum isolation, hardest to manage schema updates. 2. **Schema-per-Tenant:** Good isolation, uses one database. 3. **Shared-Database, Shared-Schema:** Lowest cost, highest risk of data leakage. The Architect enforces isolation using EF Core Global Query Filters (`WHERE TenantId = @id`) injected via the DI container.
+
+**31. Explain Eventual Consistency in the context of CQRS Data Access.**
+*Answer:* In CQRS, Writes happen to a primary relational DB (SQL Server). An event is published, and a background worker updates a secondary Read DB (like Redis or Elasticsearch). There is a time delay (milliseconds to seconds) between the write completing and the read database updating. The system is "eventually consistent," meaning users might read stale data immediately after a write.
+
+**32. What is Database Sharding, and how does it impact Application Data Access?**
+*Answer:* Sharding splits a massive database across multiple physical database servers based on a Shard Key (e.g., TenantId A-M goes to DB1, N-Z goes to DB2). It provides infinite horizontal scaling. However, the Application Data Access layer must dynamically select the correct Connection String based on the request's context, and Cross-Shard SQL JOINs are physically impossible.
+
+**33. You must implement a "Distributed Lock" across multiple microservices hitting the same database. How?**
+*Answer:* Do not use C# `lock` (it only works per-process). If using SQL Server, you can execute the `sp_getapplock` stored procedure via Dapper to acquire a distributed, named lock managed by the SQL engine. Alternatively, use Redis and the Redlock algorithm for distributed locking independent of the relational database.
+
+**34. In a high-throughput system, why might you configure `DbContext` pooling (`AddDbContextPool`)?**
+*Answer:* Instantiating a `DbContext` for every HTTP request is slightly expensive because it must initialize its internal services and Change Tracker. `AddDbContextPool` keeps a pool of cleared `DbContext` instances in RAM. When a request starts, it borrows a context; when it ends, the context is reset and returned, reducing GC allocations to near zero in the hot path.
+
+## 10. Summary
 Data Access is where enterprise applications live or die by performance. By understanding the EF Core Change Tracker, we can utilize it for safe, transactional Domain mutations while avoiding its memory penalties on read operations using `AsNoTracking()` and Projections. For absolute bare-metal speed on complex reporting queries, we drop down to Dapper. 
 
 In our final chapter, we will take our complete C# application and prepare it for the Cloud: Multi-Tenancy, Resiliency, Distributed Tracing, and NativeAOT deployments.
