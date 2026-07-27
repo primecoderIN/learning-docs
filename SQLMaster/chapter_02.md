@@ -232,48 +232,59 @@ public class SessionConfiguration : IEntityTypeConfiguration<Session>
 **Next up in Chapter 3:** We will dive into Constraints, Data Integrity, and enforcing the domain rules of our EV SaaS directly at the database level to protect against bad code deployments.
 
 
-# Migration Summary: DateTimeOffset to DateTime (UTC) + TimeZoneId
+# Architecture Notes: DateTime Migration Strategy (NextEvent)
 
-This document summarizes our discussion and the architectural decisions made during the migration of date and time handling in the NextEvent application.
+## 1. The Core Problem With Events
+Events are fundamentally **local time anchored** — "Concert at 8 PM in Mumbai" is a different semantic than just a UTC instant in time. This makes event management a special case. 
 
-## 1. The Problem with DateTimeOffset
-Initially, the application used `DateTimeOffset` for all date fields. While `DateTimeOffset` explicitly stores the time difference from UTC, it has limitations for future scheduled events:
-* **Political Changes:** Timezones and Daylight Saving Time (DST) rules can change due to political decisions. If a government changes a timezone offset, a `DateTimeOffset` value recorded *before* the change becomes incorrect because it hardcoded the old offset.
-* **Lack of Context:** `DateTimeOffset` tells you the offset (e.g., `+05:30`) but does not tell you *which* timezone the event belongs to (e.g., `"Asia/Kolkata"` vs another timezone that currently shares the same offset but has different DST rules).
+If a region's government changes Daylight Saving Time (DST) rules or shifts their timezone offset, a previously saved `DateTimeOffset` (which hardcodes the offset, e.g. `+05:30`) will point to the wrong local time. We must store the exact geographic context (the IANA timezone ID) to dynamically calculate the correct local time.
 
-## 2. The Enterprise Strategy: UTC + TimeZoneId
-To solve this, we migrated to a split-column strategy which is standard for enterprise scheduling systems:
+## 2. The Options Compared
 
-### Business Events (The `Events` table)
-* **Date Column:** We store the absolute point in time in UTC using SQL Server's `datetime2(3)` type. 
-* **TimeZoneId Column:** We store the IANA timezone identifier (e.g., `"Asia/Kolkata"`) in a separate string column.
-* **Why?** If timezone rules change, the IANA identifier allows us to recalculate the correct local time on the fly, without needing to update the database records.
+| Type | SQL bytes | Stores | Problem |
+|---|---|---|---|
+| `DATETIME` | 8 | Local time only | Legacy, no UTC, avoid entirely |
+| `DATETIME2(3)` | 6 | UTC instant | Can't reconstruct local time without context |
+| `DATETIMEOFFSET` | 10 | UTC + offset | Offset ≠ timezone. Fails if government changes DST rules |
+| **`DATETIME2(3)` + `VARCHAR`** | **6 + ~15** | **UTC + IANA Zone** | **The Enterprise Standard. Fully future-proof.** |
 
-### Audit Logs (`CreatedAtUtc`, `UpdatedAtUtc`, etc.)
-* For fields that record *when* something happened in the past (audit fields), we use pure UTC `DateTime` mapped to `datetime2(3)`.
-* We used precision `3` (milliseconds) because it saves 2 bytes per row compared to the default precision `7` (100-nanosecond ticks), which is unnecessary for general auditing.
+## 3. The New Enterprise Strategy: "UTC + TimeZoneId"
+We implemented the split-column strategy (the bottom row of the table above):
 
-## 3. Implementation Details
+### Business Events (`Events` Table)
+- **`Date` Column:** Stores the exact point in time strictly in UTC. Mapped to `datetime2(3)` in SQL Server.
+- **`TimeZoneId` Column:** Stores the standard IANA timezone identifier (e.g., `"America/New_York"`, `"Asia/Kolkata"`).
+- **Result:** The system always knows the absolute time for ordering/querying, and the client can safely reconstruct the true local time regardless of future political DST changes.
 
-### Backend (Entity Framework Core)
-* We updated all DTOs, Queries, and Command Handlers to use `DateTime` (and `DateTime.UtcNow`) instead of `DateTimeOffset`.
-* We updated Entity Configurations (`IEntityTypeConfiguration`) to explicitly configure properties:
-  ```csharp
-  builder.Property(e => e.CreatedAtUtc).HasColumnType("datetime2(3)");
-  builder.Property(e => e.TimeZoneId).HasColumnType("varchar(50)").HasDefaultValue("UTC");
-  ```
-* **Identity Exemption:** We explicitly skipped changing `User.LockoutEnd` (and other ASP.NET Identity internal fields). ASP.NET Identity manages these internally using `DateTimeOffset`. Modifying them would break the built-in identity framework.
+### Audit Fields (`CreatedAtUtc`, `UpdatedAtUtc`, etc.)
+- Switched from `DateTimeOffset` to pure UTC `DateTime`.
+- Mapped to `datetime2(3)` (millisecond precision). 
+- **Storage Benefit:** Precision `3` requires only 6 bytes per row compared to the default `7` (which takes 8 bytes). This saves space for purely historical timestamps that don't need 100-nanosecond accuracy.
 
-### Frontend (React Client)
-* We updated the Event interfaces to include `timeZoneId`.
-* **Automatic Detection:** In the event creation and update forms, we automatically detect and send the user's browser timezone to the API, so the user doesn't have to manually select it:
-  ```typescript
-  timeZoneId: Intl.DateTimeFormat().resolvedOptions().timeZone
-  ```
-* **Rendering:** We created a utility function (`formatEventDate`) that takes the UTC Date string and the `TimeZoneId` from the API, and formats it accurately in the browser using JavaScript's native `Intl.DateTimeFormat`.
+### The Identity Exemption
+- **Important Exception:** Columns managed internally by ASP.NET Identity (like `User.LockoutEnd`) were intentionally left as `datetimeoffset`.
+- **Reason:** Changing these would break internal framework mechanics (like user authentication and lockout timers). We only change the data types for domain entities we control.
 
-## 4. Finalizing the Migration
-Because this was a fundamental structural change to the database columns (and since we are in early development), we executed a clean reset:
+## 4. Implementation Checklist
+
+**Backend (EF Core & API):**
+- [x] Switched `DateTimeOffset` properties to `DateTime` across all Entities, DTOs, Queries, and Command Handlers.
+- [x] Switched `DateTimeOffset.UtcNow` to `DateTime.UtcNow`.
+- [x] Updated all `IEntityTypeConfiguration` files to map dates to `.HasColumnType("datetime2(3)")`.
+- [x] Added `TimeZoneId` property to the `Event` entity with a default value of `"UTC"`.
+
+**Frontend (React Client):**
+- [x] Updated Event interfaces and DTOs to include `timeZoneId`.
+- [x] **Automatic Detection:** Configured `useCreateEvent` and `useUpdateEvent` form hooks to auto-detect and send the user's local timezone using the browser API:
+      `Intl.DateTimeFormat().resolvedOptions().timeZone`
+- [x] **Client-Side Rendering:** Created a `formatEventDate` utility that takes the UTC string from the API and the `timeZoneId`, and safely renders the correct local time using native JavaScript `Intl` APIs.
+
+## 5. Database Reset
+Because this involved a fundamental structural change to the column types:
+1. We executed `dotnet ef database drop --force` to clear the old schema.
+2. The `API` was restarted, which triggered `DbContext.Database.MigrateAsync()` to cleanly build the new schema mapping.
+3. The `DBInitializer` automatically seeded the fresh database with roles, users, and categories.
+
 1. Dropped the existing database.
 2. Ran the API to trigger `DbContext.Database.MigrateAsync()`, which recreated the database from scratch and applied all migrations (including our new `DateTimeStrategy` migration).
 3. Ran the `DBInitializer` seeding logic, which repopulated our roles, users, and categories into the fresh database.
