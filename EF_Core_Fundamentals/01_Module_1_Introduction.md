@@ -127,9 +127,13 @@ public class TenantsDbContext : DbContext
 
 To connect your `DbContext` to an actual SQL Server database, you configure the "Database Provider". EF Core supports many providers (SQL Server, PostgreSQL, SQLite, MySQL).
 
-In an ASP.NET Core application, this is done during dependency injection setup (typically in `Program.cs` or an extension method):
+There are two main ways to configure your connection string: using **Dependency Injection** (Best Practice for APIs) or overriding **`OnConfiguring`** inside the DbContext.
+
+### Approach 1: Dependency Injection (Program.cs)
+In modern ASP.NET Core applications (like Normora), we inject the configuration during startup:
 
 ```csharp
+// Program.cs
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
 
 // Register the DbContext and tell it to use SQL Server
@@ -139,6 +143,24 @@ builder.Services.AddDbContext<TenantsDbContext>(options =>
 });
 ```
 
+### Approach 2: Overriding `OnConfiguring`
+If you are building a Console Application, a background worker without DI, or want a fallback configuration, you can override the `OnConfiguring` method directly inside your `TenantsDbContext` class:
+
+```csharp
+public class TenantsDbContext : DbContext
+{
+    public DbSet<Tenant> Tenants { get; set; }
+
+    protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
+    {
+        // Only configure if it wasn't already configured via Dependency Injection
+        if (!optionsBuilder.IsConfigured)
+        {
+            optionsBuilder.UseSqlServer("Server=myServer;Database=NormoraDb;Trusted_Connection=True;");
+        }
+    }
+}
+```
 ### 💡 Best Practice: Connection Strings and Security
 Never hardcode connection strings in your source code. They should be loaded securely from `appsettings.json`, Azure Key Vault, or Environment Variables. 
 

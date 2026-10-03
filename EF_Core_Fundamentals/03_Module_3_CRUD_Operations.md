@@ -52,6 +52,8 @@ var filteredTitles = await context.Tenants
 This generates an optimized SQL query fetching only what was mentioned in the DTO: 
 `SELECT [t].[Id], [t].[Name] FROM [SystemTenants] As [t] WHERE DATEPART(year, [t].[CreatedDate]) = @__year_0`
 
+*(Note: We will cover the massive performance implications of Projections and exactly how they work under the hood in **Module 6: Querying and Projections**).*
+
 ---
 
 ## 2. Creating Data (Create)
