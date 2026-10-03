@@ -329,3 +329,42 @@ EF Core does not perform any action regarding the dependent entities. It assumes
 ### 5. `DeleteBehavior.ClientCascade` / `ClientSetNull`
 These behave exactly like `Cascade` and `SetNull`, but the cascading action happens **in memory** for entities currently being tracked by the `DbContext`, rather than relying on the database's foreign key constraint to cascade it at the database level.
 *   **When to use:** Generally avoided unless you are using an obscure database provider that doesn't support database-level cascading.
+
+---
+
+## 9. Conventions vs. Fluent API (Do I have to use both?)
+
+A very common question is: *"If I configure navigation properties in my C# Models, am I strictly required to also configure them in the Fluent API?"*
+
+The answer is **No**. 
+
+EF Core has a powerful feature called **Conventions** (often called "EF Core Magic"). If you name your properties following standard conventions, EF Core can automatically figure out the relationship just by looking at your C# Models (Layer 1).
+
+If you write this in your C# Models:
+
+```csharp
+public class Tenant 
+{ 
+    public ICollection<User> Users { get; set; } 
+}
+
+public class User 
+{ 
+    public Guid TenantId { get; set; } // EF Core sees this matches the 'Tenant' navigation property!
+    public Tenant Tenant { get; set; } 
+}
+```
+
+If you do absolutely nothing in the Fluent API, EF Core will **automatically** figure out:
+1. This is a One-to-Many relationship.
+2. `TenantId` is the foreign key.
+3. Because `TenantId` is a non-nullable `Guid`, it will automatically apply `DeleteBehavior.Cascade`.
+
+### So why do enterprise apps (like Normora) use the Fluent API?
+
+While conventions are great for simple apps, enterprise applications explicitly use the Fluent API for a few critical reasons:
+
+1. **Controlling Delete Behaviors:** EF Core's convention defaults to `Cascade` for required relationships. But as we saw with `Department`, you often want `DeleteBehavior.Restrict` to prevent catastrophic data loss. You *must* use the Fluent API to change this.
+2. **Unconventional Names:** If your foreign key doesn't perfectly match the class name (e.g., you have a `CreatedByUserId` foreign key pointing to the `User` table), EF Core's magic breaks. The Fluent API tells it exactly how they map.
+3. **Composite Keys:** EF Core conventions cannot automatically guess composite primary keys (like in `MembershipDepartment`). You must use `.HasKey(md => new { ... })`.
+4. **Explicitness (Best Practice):** Relying on "magic" guessing can lead to unexpected database migrations if a junior developer accidentally renames a property. Explicitly writing `.HasOne().WithMany()` guarantees the database schema matches exactly what the architect intended.
