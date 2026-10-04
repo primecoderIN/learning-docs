@@ -291,11 +291,75 @@ It only tells the JSON serialization layer: *"Don't serialize this navigation pr
 
 ---
 
-## 7. The Fluent API Cheat Sheet
+## 7. Master List: All Navigation Property Combinations
 
-*   `.HasOne().WithMany()` -> **One-to-Many** (One entity has a single reference; the other has a collection).
-*   `.HasOne().WithOne()` -> **One-to-One** (Both sides point to a single reference).
-*   `.HasMany().WithMany()` -> **Many-to-Many** (Both sides have collections).
+Based on the concepts in this module, relationships are built by combining a **Relationship Type** (One-to-Many, One-to-One, Many-to-Many) with a **Navigation Direction** (Bidirectional or Unidirectional).
+
+Here is a comprehensive list of all possible combinations, how they look in C#, how to configure them in the Fluent API, and when you should use them (with examples from Normora).
+
+### 1. One-to-Many Combinations
+
+This is the most common relationship type. One parent has multiple children. The Foreign Key is always on the child table.
+
+#### A. Bidirectional (The Standard)
+Both sides know about each other. You can navigate `Parent.Children` and `Child.Parent`.
+*   **C# Code:** Parent has `ICollection<Child>`. Child has `Parent`.
+*   **Fluent API:** `.HasOne(c => c.Parent).WithMany(p => p.Children)`
+*   **When to use:** This is the default. Use it when your business logic requires you to frequently query the relationship from both angles.
+*   **Normora Example:** `Tenant` and `User`. You frequently need to know what users belong to a tenant (`tenant.Users`), and what tenant a user belongs to (`user.Tenant`).
+
+#### B. Unidirectional: Child -> Parent (Protects Memory)
+The child knows about the parent, but the parent does *not* have a list of children.
+*   **C# Code:** Parent has NO collection. Child has `Parent`.
+*   **Fluent API:** `.HasOne(c => c.Parent).WithMany()` *(Notice `WithMany` is empty)*
+*   **When to use:** Use this when a parent has a massive amount of children. It prevents developers from accidentally loading millions of records into RAM by traversing the object graph.
+*   **Normora Example:** `Tenant` and `TenantInvitation`. You query invitations directly (`dbContext.TenantInvitations.Where(x => x.TenantId == id)`), rather than calling `tenant.Invitations`.
+
+#### C. Unidirectional: Parent -> Child (Strict Encapsulation)
+The parent has a list of children, but the child does *not* have a navigation property back to the parent (it just has the Foreign Key `ParentId`).
+*   **C# Code:** Parent has `ICollection<Child>`. Child has `Guid ParentId`, but NO `Parent` object.
+*   **Fluent API:** `.HasMany(p => p.Children).WithOne()` *(Notice `WithOne` is empty)*
+*   **When to use:** Use this in Domain-Driven Design (DDD) when the child is a "sub-entity" that cannot exist or be reasoned about outside the context of the parent.
+
+### 2. One-to-One Combinations
+
+One entity is the Principal (Parent), and the other is the Dependent (Child). The Foreign Key must live on the Dependent.
+
+#### D. Bidirectional (The Standard)
+Both sides point to each other.
+*   **C# Code:** `EntityA` has `EntityB`. `EntityB` has `EntityA`. 
+*   **Fluent API:** `.HasOne(a => a.B).WithOne(b => b.A)`
+*   **When to use:** When both entities are equally important and frequently need to reference each other.
+*   **Normora Example:** `Tenant` and `TenantBranding`. If you have the branding, you can easily find the tenant it belongs to, and vice-versa.
+
+#### E. Unidirectional: Principal -> Dependent
+The main entity knows about the dependent details, but the details don't link back.
+*   **C# Code:** `User` (Parent) has `UserProfile` (Child). `UserProfile` has NO `User` property (only `UserId`).
+*   **Fluent API:** `.HasOne(u => u.Profile).WithOne()`
+*   **When to use:** When the dependent entity is purely supplemental data. If you load a `UserProfile`, you probably don't need to traverse back up to the `User` because you already know who the user is.
+
+### 3. Many-to-Many Combinations
+
+These require a Join Table in the database. Modern EF Core can handle this invisibly, or you can manage it explicitly.
+
+#### F. Bidirectional (Implicit Join Table)
+Both sides have collections, and EF Core handles the join table behind the scenes.
+*   **C# Code:** `Student` has `ICollection<Course>`. `Course` has `ICollection<Student>`.
+*   **Fluent API:** `.HasMany(s => s.Courses).WithMany(c => c.Students)`
+*   **When to use:** When the relationship is simple and you don't need to track *when* the record was created or store extra data on the join itself.
+
+#### G. Unidirectional (Implicit Join Table)
+One side has a collection, the other side doesn't care.
+*   **C# Code:** `Post` has `ICollection<Tag>`. `Tag` has NO collection of Posts.
+*   **Fluent API:** `.HasMany(p => p.Tags).WithMany()`
+*   **When to use:** When you only traverse in one direction.
+
+#### H. Explicit Join Entity (The "Two One-to-Manys" Method)
+You manually create the Join Class in C# because you need to store extra data on the relationship itself.
+*   **C# Code:** You create a third class: `JoinEntity`. Entity A has `ICollection<JoinEntity>`, Entity B has `ICollection<JoinEntity>`, JoinEntity points to both A and B.
+*   **Fluent API:** You don't use `.WithMany()`. Instead, you configure two One-to-Many relationships.
+*   **When to use:** Whenever the relationship itself has properties (dates, roles, statuses, etc.). 
+*   **Normora Example:** `TenantMembership` and `Department`. Since users can join departments with specific roles or start dates, Normora explicitly creates `MembershipDepartment` to store that extra join data.
 
 ---
 
