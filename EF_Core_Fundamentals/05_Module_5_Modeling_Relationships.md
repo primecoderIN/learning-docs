@@ -432,3 +432,55 @@ While conventions are great for simple apps, enterprise applications explicitly 
 2. **Unconventional Names:** If your foreign key doesn't perfectly match the class name (e.g., you have a `CreatedByUserId` foreign key pointing to the `User` table), EF Core's magic breaks. The Fluent API tells it exactly how they map.
 3. **Composite Keys:** EF Core conventions cannot automatically guess composite primary keys (like in `MembershipDepartment`). You must use `.HasKey(md => new { ... })`.
 4. **Explicitness (Best Practice):** Relying on "magic" guessing can lead to unexpected database migrations if a junior developer accidentally renames a property. Explicitly writing `.HasOne().WithMany()` guarantees the database schema matches exactly what the architect intended.
+
+---
+
+## 10. Change Tracking and Object Graphs
+
+One of the most powerful features of EF Core is how the **Change Tracker** watches navigation properties to automatically manage relationships in the database. EF Core tracks entire "Object Graphs", not just single rows.
+
+### 1. Automatically Inserting Children (Graph Insertion)
+If you fetch a tracked parent entity, you can simply add a new object to its collection navigation property. You **do not** need to explicitly add the child to the `DbContext` or manually set its Foreign Key.
+
+```csharp
+// 1. Fetch a tracked tenant
+var tenant = await dbContext.Tenants.Include(t => t.Users).FirstAsync(t => t.Id == 1);
+
+// 2. Add a brand new user to the navigation property
+tenant.Users.Add(new User { Name = "Sanjeev" }); 
+
+// 3. Save!
+await dbContext.SaveChangesAsync();
+```
+**What happens:** EF Core scans the `tenant.Users` collection, sees the new `User`, automatically sets its `TenantId` Foreign Key to `1`, and executes an `INSERT` statement.
+
+### 2. Changing Relationships (Re-parenting)
+You can update foreign keys in the database simply by assigning a different tracked object to a reference navigation property.
+
+```csharp
+var user = await dbContext.Users.FirstAsync(u => u.Id == 5);
+var newDepartment = await dbContext.Departments.FirstAsync(d => d.Name == "IT");
+
+// Re-assign the navigation property
+user.Department = newDepartment;
+
+await dbContext.SaveChangesAsync();
+```
+**What happens:** The Change Tracker notices `user.Department` changed. It automatically updates the underlying `user.DepartmentId` column to match `newDepartment.Id` and executes an `UPDATE` statement.
+
+### 3. "Fixing Up" the Graph (Navigation Fixup)
+If you insert a new record, EF Core will automatically populate the navigation properties of other tracked objects to reflect reality, even before you query the database again.
+
+```csharp
+var tenant = await dbContext.Tenants.FirstAsync(t => t.Id == 1);
+
+var newUser = new User { Name = "Alice", TenantId = 1 };
+dbContext.Users.Add(newUser); 
+
+// At this EXACT moment (even before SaveChanges), EF Core looks at the TenantId.
+// It realizes Tenant 1 is already tracked in memory.
+// It automatically adds 'newUser' into 'tenant.Users'!
+
+Console.WriteLine(tenant.Users.Contains(newUser)); // This will print TRUE!
+```
+The Change Tracker ensures that your C# object graph perfectly matches the Foreign Keys you've assigned in memory.
