@@ -280,3 +280,69 @@ var activeUsers = await db.Users
 ```
 
 This is one of the most fundamentally important performance patterns in Entity Framework Core.
+
+---
+
+## 8. Loading Related Data: Eager Loading (`.Include()`)
+
+By default, when you query an entity in EF Core, **it does not load related data**. 
+
+If you query a `User` from the database, its navigation properties (like `user.Tenant`) will be `null`. If you try to access `user.Tenant.Name`, your application will crash with a `NullReferenceException`.
+
+To fix this, you use **Eager Loading** via the `.Include()` method.
+
+### The Syntax (Normora Example)
+
+```csharp
+var user = await _context.Users
+    .Include(u => u.Tenant) // Eagerly load the related Tenant data!
+    .SingleOrDefaultAsync(u => u.Id == id);
+
+Console.WriteLine(user.Tenant.Name); // This now works perfectly!
+```
+
+### What happens in the Database?
+When you use `.Include()`, EF Core translates it into a SQL `JOIN`. It fetches both the User and the Tenant in a **single round-trip** to the database:
+
+```sql
+SELECT [u].[Id], [u].[Name], [u].[TenantId], [t].[Id], [t].[Name]
+FROM [SystemUsers] AS [u]
+LEFT JOIN [SystemTenants] AS [t] ON [u].[TenantId] = [t].[Id]
+WHERE [u].[Id] = @id
+```
+
+### Loading Multiple Levels (`ThenInclude`)
+If you need to go deeper—for example, loading a `User`, their `Tenant`, and then the `TenantBranding` profile for that tenant—you use `.ThenInclude()`:
+
+```csharp
+var user = await _context.Users
+    .Include(u => u.Tenant)           // 1. Load the Tenant
+        .ThenInclude(t => t.Branding) // 2. Load the Branding FOR that Tenant
+    .SingleOrDefaultAsync(u => u.Id == id);
+```
+
+### Why is this important?
+Eager loading is crucial for performance. If you forget to use `.Include()` but still need the related data, you might be tempted to loop through records and query the database one-by-one (known as the dreaded **N+1 Query Problem**). Eager loading solves this by bringing everything back in one highly-optimized query.
+
+### The Danger of Eager Loading: Object Cycle Errors (JSON)
+If you heavily use `.Include()` on bidirectional relationships and try to return that entity directly from a Web API controller, your application will crash with a `JsonException: A possible object cycle was detected`.
+
+**Why?**
+1. EF Core successfully loads the `User` and their `Tenant` using the JOIN.
+2. The Web API's JSON Serializer starts building the HTTP response.
+3. It serializes the `User`, sees the `Tenant` property, and dives into it.
+4. Inside the `Tenant`, it sees the `Users` collection, dives into it, finds the original `User`, dives into the `Tenant`... and loops infinitely until the server crashes.
+
+**How to fix it:**
+1. **(Best Practice):** Use DTOs and Projections (`.Select()`) so you never return raw EF Core entities directly to the client. This gives you ultimate control over exactly what JSON is created without permanently locking your database models.
+2. **(Model Fix - `[JsonIgnore]`):** Add `[JsonIgnore]` to the "child" side of the navigation property (as covered in Module 5). 
+   * **How it breaks the loop:** When the serializer dives into the `Tenant` and reads the `User` again, it sees `[JsonIgnore]` on `user.Tenant`, stops serializing that path immediately, and safely cuts the infinite cycle.
+   * **The Catch:** If you *ever* actually wanted to return a `User` from a specific API endpoint and include their `Tenant` data in the JSON response, you can't. `[JsonIgnore]` permanently blocks that property from ever being serialized anywhere in your entire app.
+3. **(Global API Fix):** Tell your API's JSON Serializer to gracefully ignore cyclical references in `Program.cs`:
+   ```csharp
+   builder.Services.AddControllers().AddJsonOptions(options =>
+   {
+       // If it sees an object it already serialized, it just skips it!
+       options.JsonSerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles;
+   });
+   ```

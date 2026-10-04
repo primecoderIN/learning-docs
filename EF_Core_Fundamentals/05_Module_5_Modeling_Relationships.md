@@ -499,3 +499,55 @@ dbContext.Users.Add(newUser);
 Console.WriteLine(tenant.Users.Contains(newUser)); // This will print TRUE!
 ```
 The Change Tracker ensures that your C# object graph perfectly matches the Foreign Keys you've assigned in memory.
+
+---
+
+## 11. Advanced Relationships: Alternate Keys (`HasPrincipalKey`)
+
+By default, in relational databases and EF Core, a **Foreign Key always points to the Primary Key** of the parent table. 
+
+If your `Genre` table has a primary key called `Id`, and your `Movie` table has a foreign key called `MainGenreId`, EF Core **automatically** knows they link together. Therefore, calling `.HasPrincipalKey(genre => genre.Id)` in the Fluent API is technically **redundant and unnecessary**. 
+
+### When do you actually NEED `HasPrincipalKey`?
+You use `HasPrincipalKey` when you want a Foreign Key to point to a unique column that is **NOT** the Primary Key. This is called an **Alternate Key**.
+
+### A Real-World Use Case (Normora)
+Every `Tenant` in Normora has a `Guid Id` as its Primary Key. However, for white-label routing, every `Tenant` also has a unique string called a `Slug` (e.g., `"acme-corp"`).
+
+Imagine building a public API for Normora so third-party systems can push `SupportTickets`. Those third-party systems might not know the internal `Guid Id` of the tenant, but they *do* know the `Slug`.
+
+```csharp
+public class Tenant
+{
+    public Guid Id { get; set; } // Primary Key
+    public string Slug { get; set; } // Alternate Unique Key ("acme-corp")
+    
+    public ICollection<SupportTicket> SupportTickets { get; set; }
+}
+
+public class SupportTicket
+{
+    public Guid Id { get; set; }
+    public string Issue { get; set; }
+    
+    // The Foreign Key is the string Slug, NOT the Guid Id!
+    public string TenantSlug { get; set; } 
+    public Tenant Tenant { get; set; }
+}
+```
+
+If we try to configure this without `HasPrincipalKey`, EF Core will crash because it will try to link the `string TenantSlug` to the `Guid Id` (the default Primary Key), and the data types don't match.
+
+We fix this by explicitly pointing the relationship to the Alternate Key:
+
+```csharp
+builder.Entity<SupportTicket>()
+    .HasOne(ticket => ticket.Tenant)
+    .WithMany(tenant => tenant.SupportTickets)
+    .HasForeignKey(ticket => ticket.TenantSlug) // 1. The FK is the string property
+    .HasPrincipalKey(tenant => tenant.Slug);    // 2. We explicitly tell EF Core to point it to the Slug, NOT the Id!
+```
+
+**Rule of Thumb:**
+*   If your Foreign Key points to the parent's **Primary Key** (like `Id`), you **do not** need `HasPrincipalKey`.
+*   If your Foreign Key points to a unique **Alternate Key** (like an Email, a Slug, or a Social Security Number), you **must** use `HasPrincipalKey`.

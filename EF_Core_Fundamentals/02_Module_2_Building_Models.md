@@ -149,6 +149,10 @@ When building enterprise applications like Normora, you will frequently use thes
    *   **Use Case:** Restricts the maximum length of the data. Without this, a string property might map to an unbounded `varchar(max)` column, which is terrible for database indexing and performance. Setting `.HasMaxLength(128)` ensures the column is created as `varchar(128)`.
 6. **`IsRequired()`**
    *   **Use Case:** Adds a `NOT NULL` constraint to the database column. In Normora, a Tenant absolutely must have a Name. If someone attempts to save a Tenant with a null name, EF Core will throw an exception before even hitting the database, and the database schema will enforce it as well.
+7. **`HasData(params TEntity[] data)`**
+   *   **Use Case:** Used for **Data Seeding**. It hardcodes `INSERT` (or `UPDATE`) statements directly into your database migrations to guarantee that critical initial data exists when the app boots.
+   *   **Normora Example:** Seeding the default `SystemRoles` (Owner, Admin, Member) so the authorization system functions correctly on a brand new deployment.
+   *   **Crucial Rule:** You **must** manually provide the Primary Key (e.g., `Id = 1`) inside the `new` object you pass to `HasData()`. EF Core relies on this hardcoded Primary Key to track future changes to the seeded data and generate correct migration updates.
 
 ---
 
