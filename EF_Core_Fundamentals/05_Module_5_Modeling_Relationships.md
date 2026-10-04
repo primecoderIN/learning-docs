@@ -365,7 +365,11 @@ You manually create the Join Class in C# because you need to store extra data on
 
 ## 8. Demystifying Delete Behaviors (`OnDelete`)
 
-When configuring relationships via the Fluent API, deciding what happens to "child" records when the "parent" is deleted is critical for data integrity. EF Core provides several `DeleteBehavior` options.
+When configuring relationships via the Fluent API, deciding what happens to "child" records when the "parent" is deleted is critical for data integrity. 
+
+> **Crucial Rule:** The `OnDelete()` behavior always dictates what happens to the **Child (Dependent) table** (the one holding the Foreign Key) when a record in the **Parent (Principal) table** is deleted. The trigger is the parent's deletion; the victim is the child table.
+
+EF Core provides several `DeleteBehavior` options.
 
 ### 1. `DeleteBehavior.Cascade` (The Default for Required Relationships)
 If the parent is deleted, all related child records are automatically deleted as well. 
