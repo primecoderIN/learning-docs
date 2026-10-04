@@ -98,8 +98,7 @@ public class TenantInvitation
 }
 ```
 
-*   **What happens in EF Core?** EF Core is perfectly fine with this! The foreign key (`TenantId` on the `TenantInvitations` table) is created exactly the same way. 
-*   **How to configure (Fluent API):** You simply leave the second part of the mapping empty, exactly as seen in Normora's `TenantsDbContext`:
+*   **How to configure (Fluent API):** You explicitly define the relationship but leave the `WithMany()` method empty, exactly as seen in Normora's `TenantsDbContext`:
     
     ```csharp
     modelBuilder.Entity<TenantInvitation>()
@@ -109,8 +108,20 @@ public class TenantInvitation
         .OnDelete(DeleteBehavior.Cascade);
     ```
 
-*   **When to use:** Use this to prevent massive, accidental data loading ("Object Graph Pollution") and to keep your domain models focused strictly on the traversal paths you actually need.
-*   **Best Practice:** Always use Unidirectional relationships when the "Many" side contains a massive amount of data (e.g., Audit Logs, Invitations, Transactions). Query those entities directly using `DbContext.TenantInvitations.Where(i => i.TenantId == id)` with pagination, rather than relying on a `.Invitations` navigation property.
+*   **What exactly happens when `.WithMany()` is left empty?**
+    1. **"The Parent has Many Children, but I don't want to track them."** You are telling EF Core: "A Tenant can have many Invitations, but my C# `Tenant` class does NOT have an `ICollection<TenantInvitation>` property."
+    2. **Database Level:** **Nothing changes.** EF Core still correctly creates a One-to-Many relationship in the SQL database, including the `TenantId` Foreign Key column on the `TenantInvitations` table.
+    3. **C# Code Level:** Because the `Tenant` class has no collection property, you **cannot navigate** from the Parent to the Child in memory (e.g., `tenant.Invitations` doesn't exist). You can only navigate from Child to Parent (`invitation.Tenant`).
+
+*   **Why is this a Best Practice?** Use this to prevent massive, accidental data loading ("Object Graph Pollution"). If a `Tenant` has 100,000 invitations over its lifetime, and you provided a navigation property, a developer might accidentally loop through `tenant.Invitations`, instantly loading all 100,000 rows into RAM and crashing the API.
+*   **How to query instead:** Always use Unidirectional relationships when the "Many" side contains a massive amount of data (e.g., Audit Logs, Invitations). Query those entities directly using the `DbContext` with pagination:
+    ```csharp
+    // Developers MUST do this instead:
+    var invites = await dbContext.TenantInvitations
+        .Where(i => i.TenantId == tenantId)
+        .Take(50) // Safe pagination!
+        .ToListAsync();
+    ```
 
 ---
 
