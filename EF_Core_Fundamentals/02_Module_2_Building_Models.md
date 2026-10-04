@@ -206,6 +206,26 @@ var olderTenants = await context.Tenants
     .Where(t => EF.Property<DateTime>(t, "CreatedAt") < new DateTime(2023, 1, 1))
     .ToListAsync();
 ```
+### Advanced: Applying Shadow Properties Globally
+If you want *every single table* in your entire database to have auditing columns, you do not need to configure them one-by-one in 50 different `IEntityTypeConfiguration` classes! 
+
+Instead, you can loop through your entities dynamically in `OnModelCreating`:
+
+```csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    base.OnModelCreating(modelBuilder);
+
+    // Loop through ALL entities registered in the DbContext
+    foreach (var entityType in modelBuilder.Model.GetEntityTypes())
+    {
+        // Automatically inject these shadow properties into EVERY table!
+        modelBuilder.Entity(entityType.ClrType).Property<DateTime>("CreatedAt");
+        modelBuilder.Entity(entityType.ClrType).Property<Guid>("CreatedByUserId");
+    }
+}
+```
+If you combine this global configuration with the `SaveChanges()` interception trick (to auto-fill the dates when saving), you achieve a **100% automated enterprise auditing system**. Your C# domain models stay perfectly clean, and developers literally don't have to write a single line of auditing code ever again!
 
 ### When NOT to use Shadow Properties
 **Never use shadow properties for core business data.** If your application logic or UI frequently needs to read, write, or display the data (e.g., `DateOfBirth`, `Price`, `IsActive`), it **must** be a real property in your C# class. 
