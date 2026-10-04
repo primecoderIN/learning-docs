@@ -96,9 +96,12 @@ await context.SaveChangesAsync();
 
 ---
 
-## 4. Deleting Data (Delete)
+## 4. Deleting Data: Hard Delete vs. Soft Delete
 
-Deleting follows a similar pattern to updating. We fetch the record, pass it to the `Remove` method, and save changes.
+When removing data from an enterprise application, you must choose between a **Hard Delete** (permanently erasing the row from SQL) or a **Soft Delete** (flagging the row as deleted but keeping the historical data).
+
+### Approach A: The Hard Delete (`.Remove()`)
+A hard delete permanently destroys the record in the database.
 
 ```csharp
 var existingTenant = await context.Tenants.FindAsync(id);
@@ -106,14 +109,12 @@ if (existingTenant == null) return NotFound();
 
 // Deleted only in memory
 context.Tenants.Remove(existingTenant); 
-// Note: We can also do it directly on the context: context.Remove(existingTenant); 
-// This works the exact same way because DbContext knows where Tenants are saved.
 
-// Deleted from the database
+// Physically deleted from the database (DELETE FROM SystemTenants WHERE Id = ...)
 await context.SaveChangesAsync(); 
 ```
 
-### 💡 Pro-Tip: The One-Round-Trip Deletion Trick
+#### 💡 Pro-Tip: The One-Round-Trip Hard Delete Trick
 In the example above, we made a round-trip to the database just to fetch the record so we could delete it. If we don't care about throwing a 404 Not Found error (e.g., if it's already gone, we don't care), we can do this in **one round trip**:
 
 ```csharp
@@ -126,6 +127,65 @@ context.Tenants.Remove(stubTenant);
 // Executes the DELETE statement based purely on the ID!
 await context.SaveChangesAsync();
 ```
+
+### Approach B: The Soft Delete (The Enterprise Standard)
+In systems like Normora, you rarely want to Hard Delete a Tenant or User. Doing so would orphan audit logs, break historical invoices, and destroy data you might need for compliance.
+
+Instead, we use a **Soft Delete**. We add a boolean flag to our entity and *Update* the record instead of deleting it.
+
+```csharp
+public class Tenant
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; }
+    
+    // The Soft Delete Flag
+    public bool IsDeleted { get; set; } 
+}
+```
+
+When an admin clicks "Delete", we do not call `.Remove()`. We update the flag:
+
+```csharp
+var existingTenant = await context.Tenants.FindAsync(id);
+if (existingTenant == null) return NotFound();
+
+// SOFT DELETE: Just flip the flag!
+existingTenant.IsDeleted = true;
+
+// Executes an UPDATE statement, NOT a DELETE statement!
+await context.SaveChangesAsync();
+```
+
+*(Note: To ensure these soft-deleted records don't show up in normal queries, you combine this with the **Global Query Filter** pattern discussed in Module 6).*
+
+### Advanced: Intercepting `.Remove()` to force a Soft Delete
+Sometimes developers accidentally call `context.Remove()` even when they are supposed to Soft Delete. You can protect your database by overriding the `SaveChanges` method in your `DbContext` to automatically intercept deletions and convert them into updates!
+
+```csharp
+public override int SaveChanges()
+{
+    // Find all entities that are currently marked as "Deleted" in memory
+    var entries = ChangeTracker.Entries()
+        .Where(e => e.State == EntityState.Deleted);
+
+    foreach (var entry in entries)
+    {
+        // If the entity supports soft delete (e.g. has an IsDeleted property)
+        if (entry.Entity is Tenant tenant) // Or an ISoftDeletable interface
+        {
+            // 1. Change the state from "Deleted" back to "Modified"
+            entry.State = EntityState.Modified;
+            
+            // 2. Flip the soft delete flag
+            tenant.IsDeleted = true;
+        }
+    }
+
+    return base.SaveChanges();
+}
+```
+Now, even if a junior developer calls `.Remove()`, EF Core will secretly swap it to an `UPDATE IsDeleted = 1` right before it hits the database!
 
 ## 5. Debugging EF Core (Logging)
 If you want to see exactly what SQL statements EF Core is generating, you can enable console logging in your options builder:
