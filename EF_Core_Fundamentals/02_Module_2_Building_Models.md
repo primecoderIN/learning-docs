@@ -156,7 +156,70 @@ When building enterprise applications like Normora, you will frequently use thes
 
 ---
 
-## 4. Registering the DbContext (Dependency Injection Lifetimes)
+## 4. Shadow Properties (Hidden Columns)
+
+A **Shadow Property** is a column that exists in your database table, but **does not exist** as a property in your C# entity class. The value and state of a shadow property are maintained purely by the EF Core Change Tracker.
+
+### How to Configure a Shadow Property
+Because the property doesn't exist in your C# class, you must configure it using the Fluent API by passing the data type and a string name:
+
+```csharp
+public class TenantConfiguration : IEntityTypeConfiguration<Tenant>
+{
+    public void Configure(EntityTypeBuilder<Tenant> builder)
+    {
+        // Tell EF Core to create a DateTime column named 'CreatedAt'
+        // even though the 'Tenant' C# class has no such property!
+        builder.Property<DateTime>("CreatedAt")
+               .HasValueGenerator<CreatedDateGenerator>(); // (Optional) Auto-generates the value on insert
+               
+        // We can also create a hidden column for auditing who created this record!
+        builder.Property<Guid>("CreatedByUserId");
+    }
+}
+```
+
+### The WHY (The Use Case)
+The primary use case for Shadow Properties is **Auditing**. 
+In enterprise systems like Normora, DBAs usually require columns like `CreatedAt`, `LastModifiedAt`, and `CreatedByUserId` on every single table for compliance and security. However, as a C# developer, you absolutely do not want these infrastructural database concerns polluting your pure Domain Models. By using shadow properties, you keep your C# classes perfectly clean while keeping the database schema fully compliant!
+
+### How to Read and Write Shadow Properties
+Since `tenant.CreatedAt` doesn't exist in C#, how do you interact with it? You have to ask the Change Tracker!
+
+**Setting the value manually:**
+```csharp
+var newTenant = new Tenant { Name = "Acme Corp" };
+context.Tenants.Add(newTenant);
+
+// Tell the Change Tracker to set the shadow properties
+context.Entry(newTenant).Property("CreatedAt").CurrentValue = DateTime.UtcNow;
+context.Entry(newTenant).Property("CreatedByUserId").CurrentValue = currentUserId;
+
+await context.SaveChangesAsync();
+```
+*(Note: You can also assign a `HasValueGenerator` in the Fluent API or use an intercepted `SaveChanges` (like we did for Soft Deletes) so EF Core sets these automatically!)*
+
+**Querying with LINQ:**
+To use it in a `Where` clause, you must use the special `EF.Property` static method:
+```csharp
+var olderTenants = await context.Tenants
+    .Where(t => EF.Property<DateTime>(t, "CreatedAt") < new DateTime(2023, 1, 1))
+    .ToListAsync();
+```
+
+### When NOT to use Shadow Properties
+**Never use shadow properties for core business data.** If your application logic or UI frequently needs to read, write, or display the data (e.g., `DateOfBirth`, `Price`, `IsActive`), it **must** be a real property in your C# class. 
+
+Because shadow properties are hidden from C#:
+1. They make LINQ queries clunky to write (`EF.Property()`).
+2. You lose compiler safety (a typo in `"CreatedDate"` will crash at runtime).
+3. They are completely invisible to the JSON serializer, meaning you can't easily return them from a Web API.
+
+**Rule of Thumb:** Reserve shadow properties strictly for hidden, infrastructural data (like audit logs or internal foreign keys that C# never needs to touch).
+
+---
+
+## 5. Registering the DbContext (Dependency Injection Lifetimes)
 
 When we register our `DbContext` in `Program.cs`, we must choose a DI lifetime. 
 
