@@ -165,6 +165,41 @@ builder.Property(t => t.CreatedAt)
     );
 ```
 
+### Normora Example 4: Reusable Custom Converter Classes (Legacy Database Integration)
+While passing inline lambdas (like we did above) is great for one-off scenarios, if you want to reuse a converter across many properties, it is best practice to create a dedicated class that inherits from `ValueConverter<TModel, TProvider>`.
+
+**The Use Case:** Imagine Normora needs to integrate with a legacy mainframe database. This 40-year-old database doesn't have a `DATETIME` column; it just stores dates as an 8-character string like `"20231004"` (`yyyyMMdd`). 
+
+We want our modern C# code to use standard `DateTime` objects, but we need EF Core to translate it to that specific 8-character string for the legacy database.
+
+```csharp
+using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
+using System.Globalization;
+
+// TModel = DateTime (What C# uses)
+// TProvider = string (What the Database uses)
+public class DateTimeToChar8Converter : ValueConverter<DateTime, string>
+{
+    public DateTimeToChar8Converter() : base(
+        // 1. C# to DB: Convert DateTime to "20231004"
+        dateTime => dateTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture),
+        
+        // 2. DB to C#: Parse "20231004" back into a DateTime object
+        stringValue => DateTime.ParseExact(stringValue, "yyyyMMdd", CultureInfo.InvariantCulture)
+    )
+    {
+    }
+}
+```
+
+**How to use it:**
+You simply pass the class type into `.HasConversion()`:
+```csharp
+builder.Property(t => t.LegacyCreatedAt)
+       .HasConversion<DateTimeToChar8Converter>();
+```
+*(Note: This is also the exact class type you would pass into the Global Bulk Configuration we discuss in the next section!)*
+
 ---
 
 ## 7. Global Value Conversions (Pre-Convention Configuration)
