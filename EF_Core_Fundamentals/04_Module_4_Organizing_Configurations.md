@@ -93,6 +93,56 @@ protected override void OnModelCreating(ModelBuilder modelBuilder)
 ```
 This second method is the ultimate best practice because when a developer adds a new table and a new configuration class, they **never have to touch `DbContext` at all**. It just works magically!
 
+### Which one should you prefer? (The "Multiple Database Engines" edge case)
+
+Choosing between these two methods depends entirely on how many database engines your application supports.
+
+#### 1. If you have ONLY ONE Database Engine (e.g., SQL Server)
+**Always prefer `ApplyConfigurationsFromAssembly`.**
+Since every configuration in your project is meant for that one specific database, you want EF Core to blindly grab all of them and apply them. It saves time and prevents human error (like forgetting to register a file).
+
+#### 2. If you have MORE THAN ONE Database Engine
+If you are supporting multiple database engines (e.g., SQL Server and PostgreSQL) and they require *different* configurations, **the "Assembly" method can actually break your app.** If you write `MovieSqlServerConfig` and `MoviePostgresConfig`, the Assembly scanner will blindly apply both, causing conflicts.
+
+In a multi-engine scenario, you have two choices:
+
+**Choice A: The Manual Way (Preferred for small multi-engine apps)**
+Use `if/else` statements in your `DbContext` to selectively load configurations based on the active provider.
+
+```csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    if (Database.IsSqlServer()) 
+    {
+        modelBuilder.ApplyConfiguration(new MovieSqlServerConfiguration());
+        modelBuilder.ApplyConfiguration(new UserSqlServerConfiguration());
+    }
+    else if (Database.IsNpgsql()) // Postgres
+    {
+        modelBuilder.ApplyConfiguration(new MoviePostgresConfiguration());
+        modelBuilder.ApplyConfiguration(new UserPostgresConfiguration());
+    }
+}
+```
+
+**Choice B: The Advanced "Separate Assemblies" Way (Enterprise multi-engine apps)**
+Put your SQL Server configs in one Class Library (`MyProject.Data.SqlServer`) and your Postgres configs in another (`MyProject.Data.Postgres`). Then, dynamically pass the correct assembly into the magic method:
+
+```csharp
+protected override void OnModelCreating(ModelBuilder modelBuilder)
+{
+    Assembly configAssembly;
+
+    if (Database.IsSqlServer()) 
+        configAssembly = typeof(SomeSqlServerSpecificClass).Assembly;
+    else 
+        configAssembly = typeof(SomePostgresSpecificClass).Assembly;
+
+    // Magically loads ALL configs, but only from the correct project!
+    modelBuilder.ApplyConfigurationsFromAssembly(configAssembly);
+}
+```
+
 ---
 
 ## Why is Approach 2 the Best Practice?
