@@ -109,6 +109,14 @@ public class TenantsDbContext : DbContext
 }
 ```
 
+### Why EF Core Defaults to the "Worst-Case" (e.g., `nvarchar(MAX)`)
+When you don't explicitly configure data constraints (like max length), EF Core defaults to the "safest-case" scenario to prevent your application from crashing. 
+
+1. **The "Safety First" Principle:** In C#, a `string` has virtually no length limit. However, relational databases require an exact maximum length. If EF Core blindly guessed `nvarchar(255)` for a `Title` column, the database would throw a **Data Truncation Exception** and crash the moment a user typed a 256-character title. To guarantee that *any* valid C# string can be saved without crashing, EF Core defaults to the absolute maximum size: `nvarchar(MAX)`.
+2. **C# Types Lack Database Context:** To EF Core, `public string Title` and `public string Synopsis` look exactly the same. It has no idea that a title shouldn't exceed 100 characters.
+
+While `nvarchar(MAX)` prevents crashes, it is the "worst-case" for database performance (slower indexing, higher storage overhead). This is precisely why we must use the Fluent API to override these safe defaults and tell EF Core our actual business constraints!
+
 ### Common Fluent API Methods & Their Use Cases
 
 When building enterprise applications like Normora, you will frequently use these Fluent API methods to define exact database constraints:
