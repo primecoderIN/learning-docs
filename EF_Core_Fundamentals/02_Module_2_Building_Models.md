@@ -117,6 +117,22 @@ When you don't explicitly configure data constraints (like max length), EF Core 
 
 While `nvarchar(MAX)` prevents crashes, it is the "worst-case" for database performance (slower indexing, higher storage overhead). This is precisely why we must use the Fluent API to override these safe defaults and tell EF Core our actual business constraints!
 
+#### Other Types Affected by "Worst-Case" Defaults
+This "safest/widest" behavior isn't just for strings. Here are other C# types where EF Core takes a heavily unoptimized approach by default:
+
+1. **`byte[]` (Byte Arrays):** Has no fixed length in C#. 
+   * **Default:** `varbinary(MAX)`. 
+   * **Problem:** If you are storing a 32-byte hash, `MAX` is a massive waste of architecture. Use `.HasMaxLength(32)`.
+2. **`DateTime`:** Highly precise in C#.
+   * **Default:** `datetime2(7)` (Takes 8 bytes). 
+   * **Problem:** If you only need a Birthday (Date), use `.HasColumnType("date")` (Takes 3 bytes).
+3. **`decimal`:** 128-bit high-precision number.
+   * **Default:** Usually `decimal(18, 2)` (18 total digits, 2 decimal places). 
+   * **Problem:** If you are storing cryptocurrency, 2 decimal places will heavily truncate your data. If storing simple prices, `18` digits is overkill.
+4. **`enum` (Enumerations):** 
+   * **Default:** `int` (4 bytes).
+   * **Problem:** If your enum only has 3 states, it easily fits in a `tinyint` (1 byte). Over millions of rows, the storage waste is significant.
+
 ### Common Fluent API Methods & Their Use Cases
 
 When building enterprise applications like Normora, you will frequently use these Fluent API methods to define exact database constraints:
