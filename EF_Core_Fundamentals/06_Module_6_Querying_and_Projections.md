@@ -342,7 +342,67 @@ If you heavily use `.Include()` on bidirectional relationships and try to return
    ```csharp
    builder.Services.AddControllers().AddJsonOptions(options =>
    {
-       // If it sees an object it already serialized, it just skips it!
        options.JsonSerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles;
    });
    ```
+
+---
+
+## 9. Global Query Filters (`.HasQueryFilter`)
+
+A **Global Query Filter** is a LINQ query predicate that is applied automatically to **every single query** executed against a specific entity type. You configure it once in the Fluent API, and EF Core silently injects it into every `SELECT`, `UPDATE`, and `DELETE` operation.
+
+### The Two Ultimate Use Cases
+
+#### 1. Soft Delete
+Instead of hard-deleting records (which destroys historical data and breaks foreign keys), many enterprise applications use "Soft Delete" by adding an `IsDeleted` boolean column.
+
+However, you don't want developers to have to remember to write `.Where(x => !x.IsDeleted)` on every single query they ever write.
+
+```csharp
+builder.Entity<User>()
+       .HasQueryFilter(u => !u.IsDeleted); 
+```
+Now, `dbContext.Users.ToList()` will *magically* only return active users. EF Core handles it invisibly!
+
+#### 2. Multi-Tenancy (The Normora Example)
+Normora is a multi-tenant application. When a user from "Tenant A" logs in, they must **never** be able to see data from "Tenant B". Relying on developers to remember to write `.Where(u => u.TenantId == currentTenantId)` on every query is a massive security risk. If they forget even once, you have a critical data leak.
+
+**The Fix:** Inject the current `TenantId` into the `DbContext`, and apply a Global Query Filter!
+
+```csharp
+public class TenantsDbContext : DbContext
+{
+    private readonly Guid _currentTenantId;
+
+    // Inject a service that knows who the current logged-in user is
+    public TenantsDbContext(DbContextOptions options, ITenantService tenantService) : base(options)
+    {
+        _currentTenantId = tenantService.GetCurrentTenantId();
+    }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // Now, EVERY query against the Users table will automatically append:
+        // "WHERE TenantId = @currentTenantId"
+        modelBuilder.Entity<User>()
+            .HasQueryFilter(u => u.TenantId == _currentTenantId);
+            
+        modelBuilder.Entity<SupportTicket>()
+            .HasQueryFilter(t => t.TenantId == _currentTenantId);
+    }
+}
+```
+This guarantees absolute data isolation at the database layer. A developer literally *cannot* accidentally query another tenant's data.
+
+### Bypassing the Filter (`IgnoreQueryFilters`)
+Sometimes, a master system administrator needs to see *everything* (e.g., calculating total active users across all tenants, or physically purging soft-deleted records in a background job).
+
+You can explicitly bypass the global filter on a per-query basis using `.IgnoreQueryFilters()`:
+
+```csharp
+// Returns ALL users, bypassing the TenantId and IsDeleted filters!
+var allSystemUsers = await dbContext.Users
+    .IgnoreQueryFilters() 
+    .ToListAsync();
+```
