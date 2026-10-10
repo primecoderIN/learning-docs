@@ -130,6 +130,14 @@ public class UserConfiguration : IEntityTypeConfiguration<User>
 }
 ```
 
+### The "No Primary Key" Advantage (Change Tracking)
+The biggest and most important difference between a Complex Type and an Owned Entity (`OwnsOne`) is that **Complex Types do not create or receive a primary key**. 
+
+Because it has no primary key, **EF Core does not track it as an entity.**
+
+*   **Owned Entities (`OwnsOne`):** Secretly have a Primary Key. They are tracked as entities. This tracking overhead can sometimes cause exceptions if you try to completely replace the object (e.g., `user.HomeAddress = new Address()`), because EF Core gets confused about whether you are deleting the old tracked key and inserting a new one.
+*   **Complex Types (`[ComplexType]`):** Have NO Primary Key. They are pure structural data. EF Core treats the `Address` object exactly the same way it treats a simple `string`. If you do `user.HomeAddress = new Address { City = "Delhi" }`, EF Core just says, *"Okay, the user's City property changed,"* and executes a simple `UPDATE` without throwing tracking exceptions.
+
 ### Complex Types vs Owned Entities
 
 | Feature | Owned Entity (`OwnsOne`) | Complex Type (`ComplexProperty`) |
