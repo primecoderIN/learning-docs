@@ -169,7 +169,25 @@ We learned about Value Conversions in Module 7. When should you use a Converter 
 
 ---
 
-## 5. Real-World Scenarios
+## 5. Querying: Do I need `.Include()`?
+
+A common question is whether you need to use `.Include()` to fetch Owned Entities or Complex Types. **The answer is NO.**
+
+EF Core considers Owned Types and Complex Types to be fundamental parts of the parent entity, not separate entities that require explicit joining.
+
+### 1. `OwnsOne` and `ComplexType` (Table Splitting)
+Because these are stored in the exact same database table as the parent entity, when you query `dbContext.Users.ToList()`, EF Core naturally pulls all columns from the `Users` table (including the `HomeCity` and `HomeStreet` columns) and automatically populates your `user.HomeAddress` object. 
+
+### 2. `OwnsMany` (Separate Tables)
+Even though an `OwnsMany` collection requires a separate database table, EF Core **still automatically loads them**. 
+
+Because you told EF Core that the `User` "owns" those shipping addresses, EF Core assumes the `User` is incomplete without them. Therefore, when you query `dbContext.Users.ToList()`, EF Core secretly performs the `JOIN` and eagerly loads the `OwnsMany` collection behind the scenes, without you ever typing `.Include()`. 
+
+*(Note: If your `OwnsMany` collection is absolutely massive and you want to prevent EF Core from automatically loading it every time you fetch a User, you usually have to redesign the architecture to use a standard `HasMany()` navigation relationship instead of `OwnsMany()`, so that you regain manual control over when it loads.)*
+
+---
+
+## 6. Real-World Scenarios
 
 ### Scenario A: True Value Objects in DDD (Complex Types)
 In Normora, a `Money` value object consists of an `Amount` and a `Currency`. It is a perfect candidate for a Complex Type.
@@ -234,7 +252,76 @@ builder.OwnsMany(t => t.AllowedIps, ip =>
 
 ---
 
-## 6. Interview Questions
+## 7. Seeding Data (`HasData`)
+
+When you want to seed data (using `.HasData()`) for an entity that contains a Complex Type or an Owned Entity, EF Core treats them very differently.
+
+### 1. Seeding Data with Complex Types (EF Core 8+)
+Because Complex Types are true value objects (they are just properties of the parent entity, not separate entities themselves), **you seed them directly inside the parent's object.** It feels very natural, exactly like writing normal C# code:
+
+```csharp
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.HasKey(u => u.Id);
+        
+        // Define it as a complex type
+        builder.ComplexProperty(u => u.HomeAddress);
+
+        // SEEDING: Just instantiate the complex type directly inside the parent!
+        builder.HasData(
+            new User 
+            { 
+                Id = Guid.Parse("11111111-1111-1111-1111-111111111111"),
+                Name = "Sanjeev",
+                HomeAddress = new Address 
+                { 
+                    Street = "123 Tech Ln", 
+                    City = "Delhi"
+                } 
+            }
+        );
+    }
+}
+```
+
+### 2. Seeding Data with Owned Entities (`OwnsOne`)
+Seeding Owned Entities is much trickier! Because EF Core secretly treats the Owned Entity as a separate tracked object with a hidden Foreign Key linking it to the parent, **you cannot seed it directly inside the parent object.**
+
+You must seed the parent first, and then seed the Owned Entity separately using an **Anonymous Object** so you can hardcode the hidden Foreign Key (e.g., `UserId`) to link them together!
+
+```csharp
+public class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        var userId = Guid.Parse("11111111-1111-1111-1111-111111111111");
+
+        // 1. Seed the Parent FIRST
+        builder.HasData(new User { Id = userId, Name = "Sanjeev" });
+
+        // 2. Configure the Owned Entity
+        builder.OwnsOne(u => u.HomeAddress, addressBuilder =>
+        {
+            // 3. SEED the Owned Entity SEPARATELY using an anonymous object!
+            // Notice how we must manually provide the hidden Foreign Key ('UserId')
+            addressBuilder.HasData(
+                new 
+                { 
+                    UserId = userId, // Hidden FK linking back to the User!
+                    Street = "123 Tech Ln", 
+                    City = "Delhi"
+                }
+            );
+        });
+    }
+}
+```
+
+---
+
+## 8. Interview Questions
 
 **Q1: What is Table Splitting in EF Core?**
 > Table Splitting is a technique where multiple C# classes are mapped to a single table in the database. For example, if a `User` class has an `Address` property (a Complex Type or Owned Entity), EF Core flattens the `Address` properties into columns within the `Users` table, preventing the need for an expensive SQL `JOIN` when querying.
