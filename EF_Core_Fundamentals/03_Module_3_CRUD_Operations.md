@@ -22,6 +22,14 @@ When fetching a single record from the database, EF Core provides three primary 
     var tenant = await context.Tenants.FindAsync(id);
     ```
 
+### Comparison: `FirstOrDefault` vs `SingleOrDefault` vs `Find`
+
+| Method | DB Hit? | Throws if >1 result? | Checks cache first? | Use When |
+|---|---|---|---|---|
+| `FirstOrDefaultAsync` | Always | No | No | You expect 0 or 1 result, order matters |
+| `SingleOrDefaultAsync` | Always | Yes | No | You expect exactly 0 or 1 (enforces business rule) |
+| `FindAsync` | Only if not cached | No | **Yes** | Fetching by primary key repeatedly in the same request |
+
 ### IQueryable vs IEnumerable (Deferred Execution)
 When you write LINQ against a `DbSet`, you are working with an `IQueryable<T>`. 
 *   **IQueryable** does not immediately fetch data. It represents a query that can be built progressively and executed by the query provider. This is called **Deferred Execution**. *Note: For large data sets, consider pagination with deferred execution.*
@@ -74,6 +82,8 @@ public async Task<IActionResult> CreateTenant(Tenant newTenant)
 }
 ```
 
+> **Note on `Add` vs `AddAsync`:** For SQL Server, `Add()` (synchronous) is actually fine for adding entities because no I/O happens — the entity is just registered in memory. The actual I/O happens during `SaveChangesAsync()`. `AddAsync()` exists for database providers with special async ID generation (like sequences in PostgreSQL). For most apps using SQL Server with GUID or identity keys, `Add()` is perfectly acceptable.
+
 ---
 
 ## 3. Updating Data (Update)
@@ -93,6 +103,27 @@ existingTenant.Domain = request.NewDomain;
 // 3. Save Changes (Generates and executes the UPDATE SQL)
 await context.SaveChangesAsync();
 ```
+
+### Disconnected Updates (ASP.NET Core APIs)
+In a web API, you typically receive a DTO from the client, not a tracked entity. You must re-fetch the entity first:
+
+```csharp
+// CORRECT: Fetch-then-update pattern
+public async Task<IActionResult> UpdateTenant(Guid id, UpdateTenantRequest request)
+{
+    var tenant = await context.Tenants.FindAsync(id);
+    if (tenant == null) return NotFound();
+
+    // Map DTO onto the tracked entity
+    tenant.Name = request.Name;
+    tenant.Domain = request.Domain;
+
+    await context.SaveChangesAsync();
+    return NoContent();
+}
+```
+
+> **WRONG approach (avoid):** Never call `context.Update(dto)` on a DTO that was not fetched from the database. This marks ALL properties as modified — even ones the user didn't change — generating a full `UPDATE` statement that overwrites every column, including ones you didn't intend to change (like `CreatedAt`, `CreatedByUserId`).
 
 ---
 
@@ -187,6 +218,28 @@ public override int SaveChanges()
 ```
 Now, even if a junior developer calls `.Remove()`, EF Core will secretly swap it to an `UPDATE IsDeleted = 1` right before it hits the database!
 
+### 💡 Pro-Tip: Using an Interface for Generic Soft Delete
+Instead of checking `if (entry.Entity is Tenant)`, use an interface to apply soft delete to all eligible entities:
+
+```csharp
+public interface ISoftDeletable
+{
+    bool IsDeleted { get; set; }
+    DateTime? DeletedAt { get; set; }
+}
+
+// In SaveChanges override:
+foreach (var entry in ChangeTracker.Entries<ISoftDeletable>()
+                                   .Where(e => e.State == EntityState.Deleted))
+{
+    entry.State = EntityState.Modified;
+    entry.Entity.IsDeleted = true;
+    entry.Entity.DeletedAt = DateTime.UtcNow;
+}
+```
+
+---
+
 ## 5. Debugging EF Core (Logging)
 If you want to see exactly what SQL statements EF Core is generating, you can enable console logging in your options builder:
 
@@ -194,3 +247,97 @@ If you want to see exactly what SQL statements EF Core is generating, you can en
 optionsBuilder.LogTo(Console.WriteLine);
 ```
 *Note:* By default, EF Core does not log sensitive data (like parameter values) until explicitly enabled via `EnableSensitiveDataLogging()`.
+
+For production applications, route EF Core logs through the standard .NET logging system:
+```csharp
+builder.Services.AddDbContext<TenantsDbContext>(options =>
+{
+    options.UseSqlServer(connectionString)
+           .LogTo(Console.WriteLine, LogLevel.Information)
+           .EnableSensitiveDataLogging(); // Only in Development!
+});
+```
+
+---
+
+## 6. Real-World Scenarios
+
+### Scenario A: Paginated User List (Normora Dashboard)
+The admin dashboard in Normora shows a paginated list of users. Using deferred execution, the filter, sort, and page are all pushed to SQL:
+
+```csharp
+public async Task<List<UserDto>> GetUsersAsync(Guid tenantId, int page, int pageSize, string? search)
+{
+    var query = context.Users
+        .Where(u => u.TenantId == tenantId && !u.IsDeleted);
+
+    if (!string.IsNullOrEmpty(search))
+        query = query.Where(u => u.Name.Contains(search) || u.Email.Contains(search));
+
+    return await query
+        .OrderBy(u => u.Name)
+        .Skip((page - 1) * pageSize)
+        .Take(pageSize)
+        .Select(u => new UserDto { Id = u.Id, Name = u.Name, Email = u.Email })
+        .ToListAsync();
+}
+```
+**Generated SQL:** Only the requested page of filtered, sorted users is fetched — never the full table.
+
+### Scenario B: Bulk Insert with `AddRange`
+When a new tenant signs up, Normora seeds default departments:
+
+```csharp
+var defaultDepartments = new[]
+{
+    new Department { Name = "Engineering", TenantId = newTenant.Id },
+    new Department { Name = "HR", TenantId = newTenant.Id },
+    new Department { Name = "Finance", TenantId = newTenant.Id },
+};
+
+// Add all at once — EF Core batches these into fewer round-trips
+context.Departments.AddRange(defaultDepartments);
+await context.SaveChangesAsync();
+```
+
+### Scenario C: Implementing ISoftDeletable System-Wide
+```csharp
+// Base class for all soft-deletable entities
+public abstract class SoftDeletableEntity : ISoftDeletable
+{
+    public bool IsDeleted { get; set; }
+    public DateTime? DeletedAt { get; set; }
+}
+
+// All entities that should be soft-deleted inherit from it
+public class Tenant : SoftDeletableEntity { ... }
+public class User : SoftDeletableEntity { ... }
+```
+Combined with the Global Query Filter (`.HasQueryFilter(e => !e.IsDeleted)`) and the `SaveChanges` interceptor, this gives a bulletproof, zero-effort soft delete system.
+
+---
+
+## 7. Interview Questions
+
+**Q1: What is the difference between `FirstOrDefaultAsync` and `SingleOrDefaultAsync`?**
+> Both return one record or `null`. The difference is `SingleOrDefaultAsync` **throws an `InvalidOperationException`** if more than one record matches. Use `FirstOrDefault` when you only care about getting *one* result (and don't mind if multiple exist). Use `SingleOrDefault` when your business logic dictates exactly one result should ever match — it enforces this as a database-level assertion.
+
+**Q2: What is the difference between a Hard Delete and a Soft Delete? When would you use each?**
+> A Hard Delete uses `context.Remove()` and executes a physical `DELETE` SQL statement — the data is permanently gone. A Soft Delete adds an `IsDeleted` boolean flag and updates it to `true` instead, keeping the row in the database. Use Soft Delete in any enterprise/compliance-heavy system where you need audit trails, historical data integrity, or the ability to recover deleted records. Use Hard Delete for truly ephemeral data (like temporary tokens or sessions) where historical records have zero value.
+
+**Q3: What is deferred execution in EF Core? Why does it matter?**
+> Deferred execution means that writing a LINQ query (`.Where()`, `.OrderBy()`, etc.) on an `IQueryable` does NOT hit the database immediately. The query is only executed when you call a terminating method like `.ToListAsync()`, `.FirstOrDefaultAsync()`, or `.CountAsync()`. This matters because you can build up complex, conditional queries (adding filters based on input parameters) without hitting the database multiple times — only one final, optimized SQL query is sent.
+
+**Q4: How does EF Core know which properties were changed when you call `SaveChanges`?**
+> The **Change Tracker** takes a snapshot of every tracked entity's property values when they are first loaded from the database. When `SaveChanges` is called, it compares the current property values against the original snapshot. Only properties that differ are included in the `UPDATE` SQL statement. This means EF Core generates minimal, precise SQL — updating only what actually changed.
+
+**Q5: What is the "stub entity" trick for deletion, and when is it useful?**
+> Instead of fetching an entity from the database just to delete it (which costs a round-trip), you create a new instance of the entity class with only the primary key set, and then call `.Remove()` on it. EF Core treats it as if it were a real tracked entity and generates a `DELETE WHERE Id = ...` statement. This is useful when you don't need to validate 404 (or handle it at the database level) and want to save a database round-trip.
+
+**Q6: Why is it dangerous to call `context.Update(dto)` on a DTO received from an API request?**
+> When you call `context.Update()`, EF Core marks ALL properties of the entity as `Modified`, which generates an `UPDATE` statement that overwrites every column in the row. If the DTO doesn't contain all fields (e.g., it omits `CreatedAt`), those fields will be set to their default values, destroying existing data. The safe pattern is to always fetch the entity first, then map only the changed fields from the DTO onto the tracked entity.
+
+---
+
+## Summary
+In this module, we mastered the four CRUD operations in EF Core. Key takeaways: use deferred execution with `IQueryable` to push filtering to the database; use soft deletes for compliance-critical data; always use the fetch-then-update pattern in disconnected APIs; and intercept `SaveChanges` to automate cross-cutting concerns like soft delete and auditing.

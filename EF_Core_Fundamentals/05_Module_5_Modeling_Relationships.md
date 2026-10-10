@@ -203,6 +203,9 @@ modelBuilder.Entity<Tenant>()
     .OnDelete(DeleteBehavior.Cascade); // If Tenant is deleted, delete Branding!
 ```
 
+### Which entity holds the Foreign Key in One-to-One?
+The Foreign Key always goes on the **Dependent** entity (the one that cannot exist without the other). `TenantBranding` cannot exist without a `Tenant`, so `TenantBranding.TenantId` is the FK. You must explicitly specify which entity holds the FK via `HasForeignKey<TDependentEntity>()` — EF Core cannot guess this for One-to-One relationships.
+
 ---
 
 ## 5. Many-to-Many Relationships
@@ -299,6 +302,22 @@ public class User
 ### The Key Distinction
 `[JsonIgnore]` **does not configure or remove the EF Core relationship.** 
 It only tells the JSON serialization layer: *"Don't serialize this navigation property."* EF Core will still fully track the foreign keys and allow you to write `.Include(u => u.Tenant)` in your C# code!
+
+### Three Ways to Fix Circular References
+
+| Approach | How | Best for |
+|---|---|---|
+| `[JsonIgnore]` on nav property | Attribute on one side of the relationship | Simple apps; quick fix |
+| DTOs + `.Select()` projection | Never return raw EF entities from API | Enterprise apps; recommended |
+| Global `IgnoreCycles` setting | Configure JSON serializer in `Program.cs` | Quick global fix; less control |
+
+```csharp
+// Global fix (Program.cs)
+builder.Services.AddControllers().AddJsonOptions(options =>
+{
+    options.JsonSerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles;
+});
+```
 
 ---
 
@@ -408,6 +427,15 @@ EF Core does not perform any action regarding the dependent entities. It assumes
 ### 5. `DeleteBehavior.ClientCascade` / `ClientSetNull`
 These behave exactly like `Cascade` and `SetNull`, but the cascading action happens **in memory** for entities currently being tracked by the `DbContext`, rather than relying on the database's foreign key constraint to cascade it at the database level.
 *   **When to use:** Generally avoided unless you are using an obscure database provider that doesn't support database-level cascading.
+
+### Delete Behavior Quick Reference
+
+| Behavior | Child records deleted? | Parent can be deleted? | FK set to NULL? |
+|---|---|---|---|
+| `Cascade` | ✅ Yes (automatically) | ✅ Yes | No |
+| `Restrict` | No | ❌ No (throws exception) | No |
+| `SetNull` | No | ✅ Yes | ✅ Yes |
+| `NoAction` | No action taken by EF Core | Database decides | No |
 
 ---
 
@@ -551,3 +579,83 @@ builder.Entity<SupportTicket>()
 **Rule of Thumb:**
 *   If your Foreign Key points to the parent's **Primary Key** (like `Id`), you **do not** need `HasPrincipalKey`.
 *   If your Foreign Key points to a unique **Alternate Key** (like an Email, a Slug, or a Social Security Number), you **must** use `HasPrincipalKey`.
+
+---
+
+## 12. Real-World Scenarios
+
+### Scenario A: Designing the Normora Relationship Map
+```text
+Tenant (1) ──────────────── (Many) User
+Tenant (1) ──────────────── (1) TenantBranding
+Tenant (1) ──────────────── (Many) Department
+User (1) ────────────────── (1) TenantMembership
+TenantMembership (M) ────── (M) Department  [via MembershipDepartment join table]
+Tenant (1) ──────────────── (Many) TenantInvitation  [unidirectional - no nav on Tenant side]
+```
+
+### Scenario B: Loading a User With All Related Data
+```csharp
+var user = await dbContext.Users
+    .Include(u => u.Tenant)                        // Tenant details
+        .ThenInclude(t => t.Branding)              // Tenant's branding
+    .Include(u => u.TenantMembership)              // Membership record
+        .ThenInclude(m => m.MembershipDepartments) // Department assignments
+            .ThenInclude(md => md.Department)      // Department details
+    .SingleOrDefaultAsync(u => u.Id == userId);
+```
+This generates a single SQL query with multiple JOINs — no N+1 problem.
+
+### Scenario C: Transferring a User Between Departments
+```csharp
+// Normora: Move user from Engineering to Product
+var membership = await dbContext.TenantMemberships
+    .Include(m => m.MembershipDepartments)
+    .SingleAsync(m => m.UserId == userId);
+
+// Remove old department assignment
+var oldAssignment = membership.MembershipDepartments
+    .First(md => md.DepartmentId == engineeringDeptId);
+dbContext.MembershipDepartments.Remove(oldAssignment);
+
+// Add new department assignment
+membership.MembershipDepartments.Add(new MembershipDepartment
+{
+    TenantMembershipId = membership.Id,
+    DepartmentId = productDeptId
+});
+
+await dbContext.SaveChangesAsync();
+```
+
+---
+
+## 13. Interview Questions
+
+**Q1: What is the difference between a bidirectional and unidirectional navigation property? When would you use each?**
+> Bidirectional means both entities have navigation properties pointing to each other (e.g., `Tenant.Users` and `User.Tenant`). Unidirectional means only one side has the navigation property. Use bidirectional when you genuinely need to traverse from both directions in code. Use unidirectional (omitting the collection on the parent) when the parent could have an unbounded number of children — to prevent developers from accidentally loading millions of records by accessing the collection.
+
+**Q2: What happens at the database level when you use `.WithMany()` with an empty argument?**
+> Nothing changes at the database level. EF Core still creates the Foreign Key column on the child table and establishes the One-to-Many relationship in the SQL schema. The only effect is at the C# code level — the parent entity simply doesn't have a collection navigation property, so you can't traverse from parent to children using the object graph. You must query children directly via `DbContext`.
+
+**Q3: Explain the difference between `DeleteBehavior.Cascade`, `Restrict`, and `SetNull`.**
+> - `Cascade`: When the parent is deleted, all child records are automatically deleted too. Use for dependent entities that can't exist without the parent.
+> - `Restrict`: Prevents deleting the parent if any children reference it. An exception is thrown. Use to protect against accidental data loss.
+> - `SetNull`: When the parent is deleted, the child's FK is set to `NULL`. The child record is kept. Use for optional relationships where children can exist independently. Requires the FK to be nullable.
+
+**Q4: What causes a circular reference exception when returning EF Core entities from an API? How do you fix it?**
+> When two entities have bidirectional navigation properties (e.g., `Tenant.Users` and `User.Tenant`), the JSON serializer enters an infinite loop — it serializes `Tenant`, then its `Users`, then each user's `Tenant`, which again has `Users`, and so on. Fixes: (1) Use DTOs/projections to never return raw entities (best practice), (2) Apply `[JsonIgnore]` to one side of the navigation property, or (3) Configure `ReferenceHandler.IgnoreCycles` globally in the JSON serializer options.
+
+**Q5: What is an Explicit Join Entity in Many-to-Many relationships? When should you use it instead of EF Core's implicit join table?**
+> An Explicit Join Entity is a manually-defined C# class that represents the join table. Use it when the relationship itself needs to store extra data — for example, when a user joins a department with a specific `RoleId`, `JoinedAt` date, or other metadata. EF Core's implicit join table (via `.HasMany().WithMany()`) is suitable only when the relationship has no extra properties.
+
+**Q6: What is Navigation Fixup in EF Core?**
+> Navigation Fixup is a Change Tracker behavior where EF Core automatically updates in-memory navigation properties to reflect FK assignments — even before `SaveChanges` is called. For example, if you set `newUser.TenantId = 1` and `Tenant 1` is already tracked in memory, EF Core automatically adds `newUser` to `tenant.Users`. This ensures the C# object graph is always consistent with the foreign keys in memory.
+
+**Q7: Why should you always explicitly configure relationships in the Fluent API rather than relying on EF Core conventions in enterprise apps?**
+> Conventions work well for simple apps but break down in enterprise scenarios: (1) EF Core's default `DeleteBehavior.Cascade` may not be appropriate for all relationships — you often need `Restrict` to prevent data loss. (2) Non-standard FK names (like `CreatedByUserId` pointing to `Users`) break convention-based detection. (3) Composite primary keys must always be explicitly configured. (4) Explicit configuration documents intent — a junior developer renaming a navigation property won't silently change the database schema.
+
+---
+
+## Summary
+In this module, we mastered all three relationship types (One-to-Many, One-to-One, Many-to-Many), understood the difference between bidirectional and unidirectional navigation, learned how delete behaviors protect data integrity, explored how the Change Tracker automatically manages object graphs, and discovered alternate keys for advanced scenarios. In the next module, we will deep-dive into querying, projections, eager loading, and global query filters.

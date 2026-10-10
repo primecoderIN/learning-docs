@@ -180,3 +180,145 @@ A standard enterprise folder structure looks like this:
 1. **Never put Configurations in the Domain layer.** The Domain layer should be ignorant of the database. `IEntityTypeConfiguration` is an EF Core interface, so it belongs in your Data/Infrastructure layer.
 2. **Match the Names:** Always name your configuration class `<EntityName>Configuration` (e.g., `MovieConfiguration`) so it is instantly discoverable.
 3. **One File Per Entity:** Never group multiple entity configurations into a single file. Keep it strict: one entity, one configuration file.
+
+---
+
+## Migrations: Versioning Your Database Schema
+
+EF Core Migrations are a **source-controlled, incremental history of changes** to your database schema. Every time your model changes, you generate a migration that captures the `Up` (apply) and `Down` (rollback) operations.
+
+### Essential CLI Commands
+
+```bash
+# Install the EF Core tools globally (one-time setup)
+dotnet tool install --global dotnet-ef
+
+# Create a new migration snapshot
+dotnet ef migrations add InitialCreate --project src/Infrastructure --startup-project src/Api
+
+# Apply all pending migrations to the database
+dotnet ef database update
+
+# Roll back to a specific migration
+dotnet ef database update PreviousMigrationName
+
+# Generate a SQL script instead of directly applying (useful for DBA review)
+dotnet ef migrations script --output migration.sql
+```
+
+### Understanding Migration Files
+
+When you run `dotnet ef migrations add`, EF Core generates a file like `20241004_AddTenantSlug.cs`:
+
+```csharp
+public partial class AddTenantSlug : Migration
+{
+    protected override void Up(MigrationBuilder migrationBuilder)
+    {
+        // Applied when running 'dotnet ef database update'
+        migrationBuilder.AddColumn<string>(
+            name: "Slug",
+            table: "SystemTenants",
+            type: "varchar(63)",
+            nullable: false,
+            defaultValue: "");
+
+        migrationBuilder.CreateIndex(
+            name: "IX_SystemTenants_Slug",
+            table: "SystemTenants",
+            column: "Slug",
+            unique: true);
+    }
+
+    protected override void Down(MigrationBuilder migrationBuilder)
+    {
+        // Applied when rolling back
+        migrationBuilder.DropIndex(name: "IX_SystemTenants_Slug", table: "SystemTenants");
+        migrationBuilder.DropColumn(name: "Slug", table: "SystemTenants");
+    }
+}
+```
+
+### Applying Migrations Automatically on Startup
+In some scenarios (e.g., Docker containers, CI/CD pipelines), you want migrations to run automatically when the app starts:
+
+```csharp
+// Program.cs
+using (var scope = app.Services.CreateScope())
+{
+    var context = scope.ServiceProvider.GetRequiredService<TenantsDbContext>();
+    await context.Database.MigrateAsync(); // Applies any pending migrations
+}
+```
+
+> **Warning:** Be careful with `MigrateAsync()` in load-balanced environments. If multiple instances start simultaneously, they may race to apply the same migration. Use a distributed lock or a dedicated migration job in production.
+
+---
+
+## Real-World Scenarios
+
+### Scenario A: Normora's Modular Configuration Setup
+
+In Normora's `TenantsDbContext`, we use `ApplyConfigurationsFromAssembly` to auto-discover all configurations in the Infrastructure assembly:
+
+```csharp
+public class TenantsDbContext : DbContext
+{
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // One line to rule them all — scans and applies all IEntityTypeConfiguration classes
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(TenantsDbContext).Assembly);
+
+        // We still manually apply cross-cutting concerns like shadow properties
+        foreach (var entityType in modelBuilder.Model.GetEntityTypes())
+        {
+            modelBuilder.Entity(entityType.ClrType).Property<DateTime>("CreatedAt");
+            modelBuilder.Entity(entityType.ClrType).Property<bool>("IsDeleted").HasDefaultValue(false);
+        }
+    }
+}
+```
+
+### Scenario B: A Data Migration (Populating a New Column)
+When you add a `Slug` column to `Tenants` and need to populate it from existing `Name` data:
+
+```csharp
+protected override void Up(MigrationBuilder migrationBuilder)
+{
+    migrationBuilder.AddColumn<string>(name: "Slug", table: "SystemTenants", nullable: true);
+
+    // Data migration: populate from existing data
+    migrationBuilder.Sql(@"
+        UPDATE SystemTenants 
+        SET Slug = LOWER(REPLACE(Name, ' ', '-'))
+        WHERE Slug IS NULL
+    ");
+
+    // Now make it non-nullable after populating
+    migrationBuilder.AlterColumn<string>(name: "Slug", table: "SystemTenants", nullable: false);
+}
+```
+
+---
+
+## Interview Questions
+
+**Q1: What is `IEntityTypeConfiguration<T>` and why is it better than configuring everything in `OnModelCreating`?**
+> `IEntityTypeConfiguration<T>` is an interface that moves entity configuration into its own dedicated class. It's better because: (1) it follows the Single Responsibility Principle, (2) the `DbContext` stays clean and focused, (3) it reduces Git merge conflicts when multiple developers work on different entities, (4) it's instantly discoverable — `TenantConfiguration.cs` is obviously the right place to look for `Tenant` configuration.
+
+**Q2: What does `ApplyConfigurationsFromAssembly` do? What's the risk in multi-database scenarios?**
+> It scans the given assembly using reflection, finds all classes implementing `IEntityTypeConfiguration<T>`, and automatically calls `ApplyConfiguration` for each one. The risk in multi-database scenarios is that if you have separate configuration classes for SQL Server and PostgreSQL in the same assembly, the scanner will blindly apply both, causing conflicts. The solution is to either use manual registration with `if/else` or separate assemblies per provider.
+
+**Q3: What is a database migration, and why is it superior to `EnsureCreated()`?**
+> A migration is a versioned, source-controlled snapshot of a schema change. Each migration has an `Up` (apply) and `Down` (rollback) method. Unlike `EnsureCreated()` (which can only create the schema from scratch), migrations support incremental changes — adding columns, renaming tables, adding indexes — without destroying existing data. They're checked into source control, meaning every environment can be brought to the same state reliably.
+
+**Q4: What is a data migration, and when is it needed?**
+> A data migration is custom SQL inside a migration's `Up()` method that transforms existing data as part of a schema change. It's needed when you add a new required column that must be populated from existing data (e.g., generating a `Slug` from a `Name`). Without a data migration, the `NOT NULL` constraint on the new column would cause the migration to fail on existing rows.
+
+**Q5: How would you handle migrations in a zero-downtime deployment?**
+> The key is to ensure migrations are backward-compatible: (1) Never drop a column or rename a column in the same migration that stops using it — keep the old column for one deployment cycle. (2) Add new columns as `nullable` first, then populate via a data migration, then add the `NOT NULL` constraint in a subsequent migration. (3) Use the "expand/contract" pattern: expand the schema (add new things), deploy the code, then contract (remove old things). This ensures the old and new app versions can coexist against the same schema.
+
+---
+
+## Summary
+In this module, we learned to use `IEntityTypeConfiguration<T>` to keep configuration organized and scalable, `ApplyConfigurationsFromAssembly` for zero-touch auto-discovery, and how migrations provide a safe, versioned, source-controlled way to evolve your database schema. In the next module, we will model the relationships between our entities.

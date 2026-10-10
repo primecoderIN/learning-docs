@@ -158,7 +158,7 @@ When building enterprise applications like Normora, you will frequently use thes
 
 ## 4. Shadow Properties (Hidden Columns)
 
-A **Shadow Property** is a column that exists in your database table, but **does not exist** as a property in your C# entity class. The value and state of a shadow property are maintained purely by the EF Core Change Tracker.
+A **Shadow Property** is a column that exists in your database table, but **does not exist** as a property in your C# entity class. The value and state of a shadow property are maintained purely by the EF Core Change Tracker. Note that if we mention some property in configuration and that property does not exist in the model, EF Core will create that property as a shadow property.
 
 ### How to Configure a Shadow Property
 Because the property doesn't exist in your C# class, you must configure it using the Fluent API by passing the data type and a string name:
@@ -202,10 +202,15 @@ await context.SaveChangesAsync();
 **Querying with LINQ:**
 To use it in a `Where` clause, you must use the special `EF.Property` static method:
 ```csharp
+// Querying a shadow property
 var olderTenants = await context.Tenants
     .Where(t => EF.Property<DateTime>(t, "CreatedAt") < new DateTime(2023, 1, 1))
     .ToListAsync();
+
+// Updating a shadow property (Usually done inside a SaveChangesInterceptor)
+context.Entry(existingTenant).Property("LastModifiedAt").CurrentValue = DateTime.UtcNow;
 ```
+
 ### Advanced: Applying Shadow Properties Globally
 If you want *every single table* in your entire database to have auditing columns, you do not need to configure them one-by-one in 50 different `IEntityTypeConfiguration` classes! 
 
@@ -272,5 +277,86 @@ context.Database.EnsureDeleted();
 context.Database.EnsureCreated();
 ```
 
+---
+
+## 6. Real-World Scenarios
+
+### Scenario A: Auditing Every Table with Shadow Properties (Normora)
+In Normora, every table requires `CreatedAt`, `CreatedByUserId`, and `UpdatedAt` columns for SOC 2 compliance. Instead of adding these to every domain model (which pollutes them), we use shadow properties globally and auto-populate them by overriding `SaveChangesAsync`:
+
+```csharp
+public override async Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+{
+    var currentUserId = _httpContextAccessor.HttpContext?.User.GetUserId();
+
+    foreach (var entry in ChangeTracker.Entries())
+    {
+        if (entry.State == EntityState.Added)
+        {
+            entry.Property("CreatedAt").CurrentValue = DateTime.UtcNow;
+            entry.Property("CreatedByUserId").CurrentValue = currentUserId;
+        }
+        if (entry.State == EntityState.Modified)
+        {
+            entry.Property("UpdatedAt").CurrentValue = DateTime.UtcNow;
+        }
+    }
+
+    return await base.SaveChangesAsync(cancellationToken);
+}
+```
+Zero developer effort — every row is automatically audited!
+
+### Scenario B: Seeding Default Roles on First Deployment
+```csharp
+public class RoleConfiguration : IEntityTypeConfiguration<SystemRole>
+{
+    public void Configure(EntityTypeBuilder<SystemRole> builder)
+    {
+        builder.HasData(
+            new SystemRole { Id = 1, Name = "Owner" },
+            new SystemRole { Id = 2, Name = "Admin" },
+            new SystemRole { Id = 3, Name = "Member" }
+        );
+    }
+}
+```
+When `dotnet ef database update` is run on a fresh deployment, the migration automatically seeds these roles. The application's authorization system works correctly from day one without manual SQL scripts.
+
+### Scenario C: Using `nvarchar` vs `varchar` Correctly
+```csharp
+// Tenant's name could contain international characters (Arabic, Chinese, etc.)
+// Use nvarchar (unicode-safe) for user-facing strings
+builder.Property(t => t.Name).HasColumnType("nvarchar").HasMaxLength(128);
+
+// Tenant's subdomain is always ASCII (e.g., "acme-corp")
+// Use varchar (non-unicode) for technical identifiers — saves 50% storage
+builder.Property(t => t.Subdomain).HasColumnType("varchar").HasMaxLength(63);
+```
+
+---
+
+## 7. Interview Questions
+
+**Q1: What is the difference between Data Annotations and the Fluent API? Which should you prefer and why?**
+> Data Annotations are C# attributes placed directly on entity classes (e.g., `[MaxLength(128)]`). The Fluent API is configured inside `OnModelCreating` or `IEntityTypeConfiguration` classes. The Fluent API is preferred in enterprise applications because: (1) it keeps domain models clean and free from database concerns, (2) it supports more advanced configurations that Data Annotations cannot express (complex indexes, shadow properties, alternate keys), and (3) it doesn't couple your domain layer to EF Core.
+
+**Q2: What is a Shadow Property? Give a real-world use case.**
+> A shadow property is a column that exists in the database but has no corresponding property in the C# entity class. It's managed purely by EF Core's Change Tracker. The most common use case is auditing — you can add `CreatedAt`, `UpdatedAt`, and `CreatedByUserId` columns to every table without polluting your domain models. You access shadow properties via `EF.Property<T>(entity, "PropertyName")` in queries.
+
+**Q3: Why must `DbContext` be registered as Scoped and not Singleton?**
+> `DbContext` is not thread-safe. If registered as Singleton, it would be shared across concurrent HTTP requests, causing race conditions, incorrect change tracking, and connection pool exhaustion. Scoped lifetime ensures one instance per HTTP request — matching the natural "unit of work" pattern — and it is properly disposed when the request ends.
+
+**Q4: Why does EF Core default to `nvarchar(MAX)` for strings, and what are the performance implications?**
+> EF Core defaults to `nvarchar(MAX)` because it has no way to know the maximum length of a C# `string`. Using `MAX` prevents data truncation exceptions but hurts performance: `MAX` columns cannot be indexed efficiently, consume more storage, and increase network transfer size. You should always use `.HasMaxLength()` in the Fluent API to set appropriate constraints.
+
+**Q5: If you define `builder.Property<Guid>("TenantId")` in configuration but the entity class has no `TenantId` property, what happens?**
+> EF Core creates it as a **shadow property**. The column will exist in the database and be managed by the Change Tracker, but it won't appear in the C# class. This is a valid pattern — for example, when using foreign keys that are purely infrastructural and don't belong in the domain model.
+
+**Q6: What is `EnsureCreated()` vs running migrations? When would you use each?**
+> `EnsureCreated()` creates the database schema based on the current model in a single shot — but it does not create a migrations history table and cannot handle schema evolution (updates). It's fine for unit tests or simple demos. Migrations (`dotnet ef migrations add`, `dotnet ef database update`) create a versioned, incremental history of schema changes and are the correct approach for any production application.
+
+---
+
 ## Summary
-In this module, we learned how to keep our domain models clean by using the Fluent API inside `OnModelCreating`, why `= null!` is used for `DbSet`, and why `DbContext` must always be registered as a Scoped service. In the next module, we will dive into creating, reading, updating, and deleting data (CRUD)!
+In this module, we learned how to keep our domain models clean by using the Fluent API inside `OnModelCreating`, why `= null!` is used for `DbSet`, how shadow properties enable invisible auditing, and why `DbContext` must always be registered as a Scoped service. In the next module, we will dive into creating, reading, updating, and deleting data (CRUD)!

@@ -406,3 +406,103 @@ var allSystemUsers = await dbContext.Users
     .IgnoreQueryFilters() 
     .ToListAsync();
 ```
+
+---
+
+## 10. Explicit Loading & Lazy Loading
+
+Besides eager loading (`Include`), there are two other ways to load related data.
+
+### 1. Explicit Loading (`.Load()`)
+Explicit loading is when you have already loaded an entity into memory, and *later* you decide you need its related data.
+
+```csharp
+var tenant = await dbContext.Tenants.SingleOrDefaultAsync(t => t.Id == 1);
+
+// ... later in the code ...
+
+// If we need the users, we can explicitly load them from the database
+await dbContext.Entry(tenant).Collection(t => t.Users).LoadAsync();
+
+Console.WriteLine($"Tenant has {tenant.Users.Count} users.");
+```
+**When to use:** When you only conditionally need related data. Instead of always eagerly loading it (and wasting bandwidth), you can load it only if a specific business condition is met.
+
+### 2. Lazy Loading (The "Magic" Anti-Pattern)
+Lazy loading means that related data is automatically fetched from the database the exact moment you access the navigation property in code.
+
+```csharp
+// 1. Fetch the tenant (DOES NOT load Users)
+var tenant = await dbContext.Tenants.SingleOrDefaultAsync(t => t.Id == 1);
+
+// 2. The moment you access .Users, EF Core pauses your C# execution, 
+// fires a new SQL query synchronously to fetch the users, and returns them!
+foreach (var user in tenant.Users)
+{
+    Console.WriteLine(user.Name);
+}
+```
+
+**Why is it an Anti-Pattern? (The N+1 Problem)**
+Lazy loading causes the infamous **N+1 Query Problem**. If you load 100 Tenants and loop through them to print their users, EF Core will execute **101 separate SQL queries** (1 query to get the tenants + 100 individual queries as you loop through each tenant's users). This will destroy your application's performance.
+
+Because of this danger, Lazy Loading is **disabled by default** in modern EF Core. You should almost always prefer Eager Loading (`Include`) or explicit Projections.
+
+---
+
+## 11. Real-World Scenarios
+
+### Scenario A: Complex API Response (Projection)
+In Normora, when an admin views the Tenant Details page, we don't just want the `Tenant`. We want the tenant details, their branding color, and a count of how many active users they have.
+
+```csharp
+var response = await dbContext.Tenants
+    .Where(t => t.Id == tenantId)
+    .Select(t => new TenantDetailsDto
+    {
+        Id = t.Id,
+        Name = t.Name,
+        BrandingColor = t.Branding.PrimaryColor, // Automatically joins the Branding table!
+        ActiveUserCount = t.Users.Count(u => !u.IsDeleted) // Automatically joins the Users table and runs a COUNT() in SQL!
+    })
+    .SingleOrDefaultAsync();
+```
+**Why this is amazing:** EF Core translates this entire complex projection into a single, highly optimized SQL query that returns *exactly* the data needed for the DTO, without ever pulling raw entities into memory.
+
+### Scenario B: E-Commerce Order History (Eager Loading)
+When a user views an order, they need to see the order details, the items in the order, and the product info for each item.
+
+```csharp
+var order = await dbContext.Orders
+    .Include(o => o.OrderItems)
+        .ThenInclude(i => i.Product)
+    .SingleOrDefaultAsync(o => o.Id == orderId);
+```
+This is the perfect use case for `Include` — we genuinely need the full entity object graph to display the page or perform business logic.
+
+---
+
+## 12. Interview Questions
+
+**Q1: What is the N+1 query problem, and how do you fix it in EF Core?**
+> The N+1 problem occurs when an application executes one query to retrieve a list of N parent records, and then executes N additional queries to retrieve the child records for each parent (usually within a `foreach` loop). This causes massive performance degradation. You fix it in EF Core by using Eager Loading (`.Include()`) to join the related tables and retrieve all data in a single SQL query, or by using Projections (`.Select()`) to fetch exactly what you need.
+
+**Q2: Explain the difference between `IQueryable` and `IEnumerable` in EF Core.**
+> `IQueryable` represents a query that has not yet been executed. When you chain methods like `.Where()` onto an `IQueryable`, EF Core builds an expression tree and translates it into a SQL `WHERE` clause, executing it only when a terminal method like `ToListAsync` is called. `IEnumerable` operates on data already in memory. Calling `.Where()` on an `IEnumerable` forces EF Core to fetch the entire table into RAM and perform the filtering in memory using LINQ-to-Objects, which is terrible for performance.
+
+**Q3: What are Global Query Filters, and what are their most common use cases?**
+> A Global Query Filter is a LINQ predicate defined in the Fluent API (e.g., `modelBuilder.Entity<User>().HasQueryFilter(u => !u.IsDeleted)`) that EF Core automatically applies to all queries against that entity type. The two most common use cases are **Soft Deletes** (automatically hiding deleted records) and **Multi-Tenancy** (automatically scoping all queries to the currently logged-in user's TenantId to prevent data leaks).
+
+**Q4: How does `.Select()` (Projection) improve performance compared to returning full entities?**
+> When you execute a query returning full entities, EF Core generates a `SELECT *` query, pulling all columns over the network and tracking the resulting objects in memory. By using `.Select(dto => ...)` *before* executing the query, EF Core translates the projection into SQL, generating a query that only selects the specific columns mapped in the DTO (e.g., `SELECT Id, Name`). This drastically reduces database I/O, network bandwidth, and application memory usage.
+
+**Q5: What is the difference between Lazy Loading and Explicit Loading?**
+> Lazy Loading automatically (and implicitly) issues a new database query the exact moment you access a navigation property in your C# code that hasn't been loaded yet. It's an anti-pattern that causes N+1 issues and is disabled by default. Explicit Loading is a manual, explicit choice to load related data for an entity already in memory using `.Entry(entity).Collection(...).LoadAsync()`. It's safer because you control exactly when the query happens.
+
+**Q6: What happens if you try to put a complex C# method inside a `.Select()` projection that is executed against the database?**
+> EF Core will throw a runtime exception because it cannot translate arbitrary C# logic (like a custom method call) into SQL. It can only translate built-in methods it understands (like string concatenation or basic math). If you need complex C# logic, you must fetch the required columns from the database first, call `.AsEnumerable()` or `.ToList()`, and *then* run the complex logic in memory.
+
+---
+
+## Summary
+In this module, we explored how to write efficient queries using deferred execution, projections, and eager loading. We learned how to avoid the N+1 problem, when to use `IQueryable` vs `IEnumerable`, and how Global Query Filters can secure our application architecture. In the final module, we will explore Value Conversions and the Change Tracker.

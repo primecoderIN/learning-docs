@@ -39,7 +39,7 @@ graph TD
 
     subgraph "Relational Database"
         D -->|Execute SQL| E[(Database Table<br>e.g., Tenants)]
-        E -.->|Confirmation| C
+        E -..->|Confirmation| C
     end
 ```
 
@@ -90,6 +90,17 @@ You might wonder why Normora chose **EF Core** instead of alternatives like Dapp
 
 **Why EF Core for a SaaS App?**
 In an enterprise app like Normora, you deal with complex relationships: A `Tenant` has many `Department`s, and many `User`s belong to a `TenantMembership`. Managing these foreign keys manually using Dapper for *inserts* and *updates* is error-prone. EF Core's Change Tracker automatically handles inserting parent and child records in the correct order, within a single transaction.
+
+### Choosing the Right Tool
+
+| Scenario | Best Choice |
+|---|---|
+| Complex domain with many relationships | EF Core |
+| Read-heavy reporting queries with complex joins | Dapper |
+| Maximum raw performance, minimal abstraction | ADO.NET |
+| Mixed workload (most enterprise apps) | EF Core + raw SQL/Dapper for hot paths |
+
+> **Real-World Tip:** In Normora, we use EF Core for all standard CRUD operations and relationship management, but drop down to raw SQL (via `dbContext.Database.ExecuteSqlRaw()`) for bulk operations like archiving old audit logs, where EF Core's row-by-row tracking would be too slow.
 
 ---
 
@@ -161,8 +172,60 @@ public class TenantsDbContext : DbContext
     }
 }
 ```
+
 ### 💡 Best Practice: Connection Strings and Security
-Never hardcode connection strings in your source code. They should be loaded securely from `appsettings.json`, Azure Key Vault, or Environment Variables. 
+Never hardcode connection strings in your source code. They should be loaded securely from `appsettings.json`, Azure Key Vault, or Environment Variables.
+
+---
+
+## 5. Real-World Scenarios
+
+### Scenario A: Multi-Context Architecture in a SaaS App
+In Normora, instead of one massive `DbContext` for the entire application, we split it into domain-specific contexts:
+
+```csharp
+// Handles tenants, users, departments
+public class TenantsDbContext : DbContext { ... }
+
+// Handles documents, file uploads
+public class DocumentsDbContext : DbContext { ... }
+
+// Handles billing, invoices
+public class BillingDbContext : DbContext { ... }
+```
+
+**Why?** Each context is responsible for a bounded domain. This follows the **Bounded Context** pattern from Domain-Driven Design (DDD). It prevents a single God-context from becoming unmanageable and allows different teams to work independently on their domains.
+
+### Scenario B: When to Use Raw SQL Alongside EF Core
+```csharp
+// Bulk archive: Mark 1 million old logs as archived in one SQL statement.
+// Using EF Core's row-by-row Change Tracker here would be catastrophically slow!
+await dbContext.Database.ExecuteSqlRawAsync(
+    "UPDATE AuditLogs SET IsArchived = 1 WHERE CreatedAt < {0}",
+    DateTime.UtcNow.AddYears(-2)
+);
+```
+
+---
+
+## 6. Interview Questions
+
+**Q1: What is an ORM, and why would you use EF Core over writing raw SQL?**
+> An ORM (Object-Relational Mapper) maps C# classes to database tables, eliminating the need to write repetitive SQL. EF Core provides compile-time safety through LINQ, automatic parameterized queries (preventing SQL injection), migration-based schema management, and relationship tracking. For complex domains with many relationships, EF Core significantly reduces bugs and development time compared to raw SQL.
+
+**Q2: What is the difference between `DbContext` and `DbSet<T>`?**
+> `DbContext` is the session/unit-of-work with the database — it manages the connection, tracks changes, and coordinates saving. `DbSet<T>` represents a single table within that session. Think of `DbContext` as the database itself and `DbSet<T>` as individual tables within it.
+
+**Q3: When would you choose Dapper over EF Core?**
+> Dapper excels in read-heavy scenarios where you need maximum performance and have complex, hand-crafted SQL queries (e.g., reporting dashboards with complex joins). EF Core is better when you need full CRUD lifecycle management, relationship tracking, migrations, and a clean domain model. In practice, many enterprise apps use EF Core for most operations and Dapper for performance-critical read queries.
+
+**Q4: Is it possible to use multiple `DbContext`s in the same application? Why would you?**
+> Yes. Multiple `DbContext`s are a best practice in large applications following the Bounded Context pattern from DDD. Each context manages a distinct domain (Tenants, Billing, Documents). This provides separation of concerns, allows teams to evolve schemas independently, and prevents a single massive context from becoming unmanageable. Each context gets its own database connection and migration history.
+
+**Q5: What happens internally when you call `SaveChangesAsync()`?**
+> EF Core's Change Tracker inspects all tracked entities for state changes (Added, Modified, Deleted). It then generates the appropriate SQL statements (INSERT, UPDATE, DELETE), wraps them in a single database transaction, and executes them. If any statement fails, the entire transaction is rolled back. After success, it updates the tracked entities (e.g., populating auto-generated primary keys back into the C# object).
+
+---
 
 ## Summary
 In this module, we learned that EF Core eliminates repetitive SQL mapping by allowing us to work purely with C# objects. The `DbContext` acts as our gateway to the database, and `DbSet` properties map directly to our tables. In the next module, we will explore how to build these entity classes (`Tenant`, `User`, etc.) and define their schemas using conventions and the Fluent API.
