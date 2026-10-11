@@ -101,9 +101,80 @@ public partial class AddedAgeToUser : Migration
 }
 ```
 
-### The `__EFMigrationsHistory` Table
-How does EF Core know which migrations have already been applied to your database? 
-The very first time you run `Update-Database`, EF Core creates a special hidden table in your SQL Server called `__EFMigrationsHistory`. Every time it successfully runs an `Up()` method, it inserts the name of the migration into this table. The next time you run `Update-Database`, it checks this table to ensure it doesn't accidentally run the same migration twice!
+### The `__EFMigrationsHistory` Table (Database Migration History)
+How does EF Core know which migrations have already been applied to your database? Does the database itself keep track of this history?
+
+**Yes, absolutely.** The database maintains its own history table to track which migrations have been executed. The very first time you apply a migration (`Update-Database` or `dotnet ef database update`), EF Core creates a special system table called **`__EFMigrationsHistory`**.
+
+#### 1. What the Table Looks Like
+The physical structure of `__EFMigrationsHistory` is lightweight and consists of two columns:
+
+| Column Name | Data Type | Description | Example Value |
+| :--- | :--- | :--- | :--- |
+| **`MigrationId`** *(PK)* | `nvarchar(150)` | Timestamp prefix + Migration name | `20261011140000_AddedAgeToUser` |
+| **`ProductVersion`** | `nvarchar(32)` | The EF Core version used to apply the migration | `9.0.0` |
+
+* `MigrationId` acts as the Primary Key. Because it starts with a UTC timestamp (e.g., `YYYYMMDDHHMMSS`), migrations are naturally sorted in chronological order.
+
+#### 2. How EF Core Uses This Table (The Sync Lifecycle)
+Whenever an update command or migration bundle runs, EF Core synchronizes your C# code against this database table:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as EF Core CLI / Bundle
+    participant DB as SQL Server (__EFMigrationsHistory)
+
+    App->>App: Scans compiled code for Migration .cs files
+    App->>DB: SELECT [MigrationId] FROM [__EFMigrationsHistory]
+    DB-->>App: Returns list of already applied migrations
+    App->>App: Computes difference (Pending = Code Migrations - Applied Migrations)
+    loop For each Pending Migration
+        App->>DB: Executes Migration Up() DDL (e.g. ALTER TABLE ...)
+        App->>DB: INSERT INTO [__EFMigrationsHistory] VALUES ('20261011140000_AddedAgeToUser', '9.0.0')
+    end
+```
+
+1. **Scan Code:** EF Core inspects your compiled assembly to discover all migration classes inheriting from `Migration`.
+2. **Query Database:** It runs `SELECT [MigrationId] FROM [__EFMigrationsHistory]`.
+3. **Compute Diff:** Any migration present in your code that is **missing** from `__EFMigrationsHistory` is flagged as **pending**.
+4. **Apply & Record:** EF Core executes the pending migration's `Up()` SQL and immediately inserts a row into `__EFMigrationsHistory` inside the exact same database transaction. If the DDL fails, the insert is rolled back!
+
+#### 3. How Idempotent SQL Scripts Use It
+When generating SQL scripts for a DBA or automated CI/CD pipeline (`dotnet ef migrations script -i` or `Script-Migration -Idempotent`), EF Core wraps every migration block with a conditional check against this history table:
+
+```sql
+IF NOT EXISTS (
+    SELECT * FROM [__EFMigrationsHistory] 
+    WHERE [MigrationId] = N'20261011140000_AddedAgeToUser'
+)
+BEGIN
+    -- 1. Apply DDL
+    ALTER TABLE [Users] ADD [Age] int NULL;
+
+    -- 2. Record migration in history table
+    INSERT INTO [__EFMigrationsHistory] ([MigrationId], [ProductVersion])
+    VALUES (N'20261011140000_AddedAgeToUser', N'9.0.0');
+END;
+```
+
+This ensures the script is completely safe to run against any database environment—if a migration has already been executed, SQL Server simply skips it.
+
+#### 4. Customizing the History Table (Modular Monoliths & Custom Schemas)
+By default, the table is named `dbo.__EFMigrationsHistory`. If you are building a Modular Monolith or microservices architecture where multiple `DbContext` instances share one database, you must isolate their migration tracking to avoid collisions:
+
+```csharp
+builder.Services.AddDbContext<BillingDbContext>(options =>
+    options.UseSqlServer(connectionString, sql =>
+        sql.MigrationsHistoryTable("__EFMigrationsHistory_Billing", "billing")));
+```
+
+#### 5. Industry Standard Across Tools
+Tracking migrations directly within a dedicated database table is not unique to EF Core—it is the universal design pattern across all enterprise database migration tools:
+* **EF Core (.NET):** `__EFMigrationsHistory`
+* **DbUp (.NET):** `SchemaVersions`
+* **Flyway (Java / Polyglot):** `flyway_schema_history`
+* **Liquibase:** `DATABASECHANGELOG`
 
 ---
 
