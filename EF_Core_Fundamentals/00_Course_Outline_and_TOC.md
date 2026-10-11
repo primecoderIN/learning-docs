@@ -69,6 +69,8 @@
 *   **What and Why:** Understanding migrations as version control for your database.
 *   **Tooling Options:** `.NET CLI` (`dotnet ef`) vs `Package Manager Console`.
 *   **The Workflow:** Generating, applying, and rolling back migrations.
+*   **Applying Migrations in Production:** Direct CLI vs. Idempotent SQL Scripts (`--idempotent`) in CI/CD vs. Migration Bundles for Containers.
+*   **Runtime Schema Validation:** The Fail-Fast Migration Guard (`GetPendingMigrationsAsync`), Roslyn analyzer warnings (`CA1860`), and Kubernetes Readiness Health Checks.
 
 ### Module 11: Real-World Application Integration & Production-Ready Database Management
 *   **EF Core in ASP.NET Core:** Registering `DbContext` in Dependency Injection, Scoped lifetimes, DbContext pooling, and `IDbContextFactory`.

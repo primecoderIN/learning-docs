@@ -517,6 +517,91 @@ flowchart LR
 4. **Controlled Deployment:** Migrations are applied via **Migration Bundles** or **reviewed SQL scripts** in an isolated CI/CD deployment job.
    > [!CAUTION]
    > Never call `dbContext.Database.Migrate()` on application startup in production. Concurrent application instances (e.g., in Kubernetes or behind load balancers) will race to apply migrations, resulting in connection pool exhaustion, deadlocks, and corrupted schemas.
+
+   #### The Production Alternative: Fail-Fast Startup Guard (`GetPendingMigrationsAsync`)
+   If the API doesn't apply migrations on startup, what happens if a deployment is rolled out before the database migration finishes? To avoid serving broken HTTP 500 errors to users, use a **read-only migration guard** at startup:
+
+   ```mermaid
+   graph TD
+       Deploy[CI/CD deploys new API pod / container] --> Startup[API Starts Up]
+       Startup --> Check{Check Pending Migrations<br>GetPendingMigrationsAsync}
+       Check -->|Pending Migrations Exist| FailFast[💥 Throw Exception & Stop Startup<br>Pod marks Unready / Crashes]
+       Check -->|No Pending Migrations| Ready[✅ Database is Synced<br>Pod marks Ready & Receives Live Traffic]
+   ```
+
+   ```csharp
+   var pendingMigrations = await context.Database.GetPendingMigrationsAsync();
+   if (pendingMigrations.Count() > 0) // ⚠️ Green squiggly: Roslyn CA1860/CA1829
+       throw new Exception("Database is not fully migrated for Module...");
+   ```
+
+   > [!NOTE]
+   > **Why the Green Squiggly on `pendingMigrations.Count() > 0`?**
+   > `GetPendingMigrationsAsync()` returns `IEnumerable<string>`. Calling `.Count() > 0` causes Roslyn code analyzers to emit warning **CA1860 / CA1829** (*"Avoid using Count() > 0 when checking for non-empty collections"*), because `.Count()` traverses the entire collection rather than stopping at the first element. The clean, performant fix is `.Any()`:
+   > ```csharp
+   > if (pendingMigrations.Any())
+   >     throw new InvalidOperationException(
+   >         $"Database is not fully migrated! Pending: {string.Join(", ", pendingMigrations)}");
+   > ```
+
+   #### Approach A: Direct Guard in `Program.cs`
+   ```csharp
+   var app = builder.Build();
+
+   // Ensure database schema matches compiled code before accepting requests
+   using (var scope = app.Services.CreateScope())
+   {
+       var context = scope.ServiceProvider.GetRequiredService<NormoraDbContext>();
+       var pendingMigrations = (await context.Database.GetPendingMigrationsAsync()).ToList();
+
+       if (pendingMigrations.Any())
+       {
+           var migrationList = string.Join(", ", pendingMigrations);
+           throw new InvalidOperationException(
+               $"Application cannot start: Database is not fully migrated! Pending migrations: [{migrationList}]");
+       }
+   }
+
+   app.Run();
+   ```
+
+   #### Approach B: As an ASP.NET Core Readiness Health Check (Cloud / Kubernetes)
+   In modern containerized deployments, rather than crashing the pod immediately, wire this check into ASP.NET Core's Health Check pipeline. The load balancer marks the pod as `503 Unhealthy` on `/health/ready` and routes 0% traffic to it until the external migration job finishes:
+
+   ```csharp
+   public class DatabaseMigrationHealthCheck : IHealthCheck
+   {
+       private readonly NormoraDbContext _context;
+
+       public DatabaseMigrationHealthCheck(NormoraDbContext context) => _context = context;
+
+       public async Task<HealthCheckResult> CheckHealthAsync(
+           HealthCheckContext context, 
+           CancellationToken cancellationToken = default)
+       {
+           var pendingMigrations = await _context.Database.GetPendingMigrationsAsync(cancellationToken);
+
+           if (pendingMigrations.Any())
+           {
+               return HealthCheckResult.Unhealthy(
+                   $"Database has pending migration(s): {string.Join(", ", pendingMigrations)}");
+           }
+
+           return HealthCheckResult.Healthy("Database schema is fully synchronized.");
+       }
+   }
+   ```
+
+   Registering in `Program.cs`:
+   ```csharp
+   builder.Services.AddHealthChecks()
+       .AddCheck<DatabaseMigrationHealthCheck>("database_migrations", tags: ["ready"]);
+
+   app.MapHealthChecks("/health/ready", new HealthCheckOptions
+   {
+       Predicate = check => check.Tags.Contains("ready")
+   });
+   ```
 5. **Least Privilege:** 
    * **Runtime Application User:** Granted only DML permissions (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `EXECUTE`).
    * **Migration Pipeline User:** Granted DDL permissions (`CREATE`, `ALTER`, `DROP`) only during deployment.
@@ -626,6 +711,17 @@ graph LR
 > 1. Target its own dedicated SQL schema using `modelBuilder.HasDefaultSchema("module_name")`.
 > 2. Use a dedicated migration history table using `options.UseSqlServer(conn, sql => sql.MigrationsHistoryTable("__EFMigrationsHistory_ModuleName", "module_name"))`.
 > This isolates both the domain tables and the migration version tracking per module within the shared physical database.
+
+**Q5: Can a DBA or auditor inspect the raw SQL executed by a Migration Bundle before approving its execution in production?**
+> **Yes.** Running `./bundle --script --idempotent > migration.sql` outputs the complete idempotent SQL script to stdout without applying any changes to the database. This allows DBAs to inspect table alters, locks, and indexing operations in staging before the bundle is executed in production.
+
+**Q6: How do you cross-compile a Migration Bundle when developing on Windows/macOS and deploying to Linux containers?**
+> Use the `--target-runtime` flag with the target Linux Runtime Identifier (RID), e.g., `dotnet ef migrations bundle --target-runtime linux-x64 --output ./migrate-bundle`. This produces a Linux-compatible ELF binary directly on a non-Linux development machine.
+
+**Q7: Comparing Direct CLI, Idempotent SQL Scripts, and Migration Bundles—when is each approach ideal?**
+> * **Direct CLI (`dotnet ef database update`):** Ideal strictly for **local development** due to rapid feedback, but prohibited in production because it requires the .NET SDK and source code on production runners.
+> * **Idempotent SQL Scripts (`dotnet ef migrations script -i`):** Ideal for **DBA-governed enterprises** requiring manual script reviews and gated execution through database management tools.
+> * **Migration Bundles (`dotnet ef migrations bundle`):** Ideal for **modern cloud/container automation** (Kubernetes init-containers, Azure DevOps, GitHub Actions), providing a single pre-compiled binary with built-in database drivers and zero external dependencies.
 
 ---
 
