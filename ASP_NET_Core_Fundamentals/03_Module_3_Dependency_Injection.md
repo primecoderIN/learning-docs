@@ -1,6 +1,10 @@
-# Module 3: Dependency Injection (DI)
+# Module 3: Dependency Injection, Lifetimes & Architectural Invariants
 
-If Middleware is the *soul* of ASP.NET Core, **Dependency Injection is the skeleton**. It holds everything together. Every middleware, every controller, every service, every database context — they are all created, connected, and destroyed by the DI container. Understanding DI is non-negotiable.
+If Middleware is the *soul* of ASP.NET Core, **Dependency Injection (DI) is the skeleton**. It holds everything together. Every middleware, every controller, every service, every database context — they are all created, connected, and destroyed by the DI container. Understanding DI is non-negotiable.
+
+In enterprise software architecture, understanding DI goes far beyond knowing how to register an interface. You must master **object lifetimes, allocation dynamics, thread safety, the captive dependency trap, and automated architectural rules enforcement.**
+
+---
 
 ## 1. What Problem Does DI Solve?
 
@@ -23,14 +27,14 @@ public class OrderService
 ```
 
 **What's wrong with this?**
-1. **Can't test it.** To unit test `PlaceOrder`, you'd actually send real emails!
-2. **Can't swap implementations.** If you switch from Gmail SMTP to SendGrid, you must find and change every `new SmtpEmailSender(...)` in your entire codebase.
-3. **Hard-coded secrets.** The SMTP password is buried in business logic.
+1. **Can't test it.** To unit test `PlaceOrder`, you'd actually send real emails over the network!
+2. **Can't swap implementations.** If you switch from Gmail SMTP to SendGrid or AWS SES, you must find and change every `new SmtpEmailSender(...)` in your entire codebase.
+3. **Hard-coded secrets.** The SMTP password is buried directly inside business logic.
 4. **Lifecycle chaos.** Who disposes of the `SmtpEmailSender`? What if it should be shared? What if it's expensive to create?
 
-> **Analogy — The Chef Who Grows His Own Tomatoes:**
-> Imagine a chef who, instead of ordering tomatoes from a supplier, personally farms, harvests, and transports tomatoes every time a customer orders pasta. The chef is now tightly coupled to farming — he can't focus on cooking!
-> 
+> **Analogy — The Chef Who Grows His Own Tomatoes:**  
+> Imagine a chef who, instead of ordering tomatoes from a supplier, personally farms, harvests, and transports tomatoes every time a customer orders pasta. The chef is now tightly coupled to farming — he can't focus on cooking!  
+>  
 > DI is like hiring a supplier (the DI container). The chef says, "I need tomatoes" (an interface), and the supplier delivers them. The chef doesn't care if they come from a local farm or an imported batch — he just cooks.
 
 ### The Solution: Inversion of Control
@@ -43,7 +47,7 @@ public class OrderService
     private readonly IEmailSender _emailSender;
 
     // The constructor DECLARES what it needs (an IEmailSender).
-    // It doesn't know or care about the implementation.
+    // It doesn't know or care about the underlying implementation.
     public OrderService(IEmailSender emailSender)
     {
         _emailSender = emailSender;
@@ -58,20 +62,38 @@ public class OrderService
 ```
 
 Now:
-1. **Testable.** In unit tests, pass a `FakeEmailSender` that records emails instead of sending them.
-2. **Swappable.** Change the implementation in one place (the DI registration).
-3. **Clean.** No hard-coded configuration values in business logic.
+1. **Testable.** In unit tests, pass a `FakeEmailSender` that records emails in memory instead of sending them.
+2. **Swappable.** Change the implementation in one place (the DI registration in `Program.cs`).
+3. **Clean.** No hard-coded configuration values or connection strings in business logic.
 
-## 2. The Built-in DI Container
+---
 
-Unlike Spring (Java) or older .NET where you needed third-party containers (Autofac, Ninject, Unity), ASP.NET Core ships with a **built-in, high-performance DI container**. It consists of two key interfaces:
+## 2. The Built-in DI Container: Two Distinct Phases
+
+Unlike Spring (Java) or older .NET where you needed third-party containers (Autofac, Ninject, Unity), ASP.NET Core ships with a **built-in, high-performance DI container**. It operates in **two strictly separated phases**:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. REGISTRATION PHASE (Mutable)                             │
+│    IServiceCollection (builder.Services)                    │
+│    - Register interfaces, classes, and factory delegates   │
+│    - Configure service lifetimes                            │
+└─────────────────────────────────────────────────────────────┘
+                               │
+                builder.Build() │ FREEZES CONTAINER
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. RESOLUTION PHASE (Immutable & Thread-Safe)               │
+│    IServiceProvider (app.Services)                          │
+│    - Resolves object graphs on demand                      │
+│    - Manages scope boundaries and object disposal           │
+└─────────────────────────────────────────────────────────────┘
+```
 
 | Interface | Purpose |
 |---|---|
-| `IServiceCollection` | The **registration** side — you tell the container what services exist |
-| `IServiceProvider` | The **resolution** side — the container creates and provides instances |
-
-In `Program.cs`, `builder.Services` is the `IServiceCollection`. After you call `builder.Build()`, the `IServiceProvider` is created and becomes read-only.
+| `IServiceCollection` | The **registration** side — you tell the container what services exist (`builder.Services`) |
+| `IServiceProvider` | The **resolution** side — the container creates and provides instances (`app.Services`) |
 
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
@@ -82,12 +104,14 @@ builder.Services.AddScoped<IEmailSender, SmtpEmailSender>();
 
 var app = builder.Build();
 // ── RESOLUTION PHASE ──
-// From this point on, the container is locked. No more registrations.
+// From this point on, the container is locked and read-only. No more registrations allowed.
 ```
+
+---
 
 ## 3. Service Lifetimes — The Most Critical Concept
 
-When you register a service, you must tell the container **how long** each instance should live. This is called the **Lifetime**. Getting this wrong causes memory leaks, data corruption, and subtle bugs that are incredibly hard to diagnose.
+When you register a service, you must tell the container **how long** each instance should live. This is called the **Lifetime**. Getting this wrong causes memory leaks, thread collisions, data corruption, and cross-tenant security breaches.
 
 ### Transient — New Instance Every Time
 ```csharp
@@ -96,7 +120,7 @@ builder.Services.AddTransient<ITaxCalculator, StandardTaxCalculator>();
 *   **What:** A **brand new instance** is created every time any class requests it. If 3 classes in the same request ask for `ITaxCalculator`, they each get a different instance.
 *   **When to use:** Lightweight, stateless utility services. Things that don't hold any state between calls.
 *   **Memory impact:** Higher — many instances created and garbage collected.
-*   **Thread safety:** Not a concern — each consumer gets its own instance.
+*   **Thread safety:** Not a concern — each consumer gets its own private instance.
 
 > **Analogy:** Disposable paper cups. Every time you want water, you grab a new cup.
 
@@ -104,10 +128,10 @@ builder.Services.AddTransient<ITaxCalculator, StandardTaxCalculator>();
 ```csharp
 builder.Services.AddScoped<IOrderRepository, SqlOrderRepository>();
 ```
-*   **What:** A **single instance** is created when the first class in an HTTP request asks for it. Every subsequent request for the same service **within the same HTTP request** gets the **exact same instance**. When the request ends, the instance is disposed.
+*   **What:** A **single instance** is created when the first class in an HTTP request asks for it. Every subsequent request for the same service **within the same HTTP request** gets the **exact same instance**. When the HTTP request ends, the instance is automatically disposed.
 *   **When to use:** This is the **most common lifetime** for web applications. EF Core's `DbContext` uses Scoped by default, ensuring all database operations in a single request share the same connection and transaction.
-*   **Memory impact:** Moderate — one instance per request.
-*   **Thread safety:** Generally safe — web requests are typically single-threaded.
+*   **Memory impact:** Moderate — exactly one instance per request.
+*   **Thread safety:** Generally safe — web requests are typically processed single-threaded.
 
 > **Analogy:** A table at a restaurant. Everyone seated at the same table (same HTTP request) shares the same waiter. Different tables (different requests) get different waiters.
 
@@ -116,7 +140,7 @@ builder.Services.AddScoped<IOrderRepository, SqlOrderRepository>();
 builder.Services.AddSingleton<ICacheService, InMemoryCacheService>();
 ```
 *   **What:** A **single instance** is created the very first time it's requested, and that **same instance** is shared across **every HTTP request** for the entire lifetime of the application.
-*   **When to use:** Caching services, configuration wrappers, `HttpClient` factories, and services that are expensive to create and are thread-safe.
+*   **When to use:** Caching services (Redis), configuration wrappers (`IOptions<T>`), `HttpClient` factories, and services that are expensive to create.
 *   **Memory impact:** Minimal — only one instance ever.
 *   **Thread safety:** **CRITICAL!** Multiple concurrent requests will access the same instance simultaneously. You **must** ensure thread safety (use `ConcurrentDictionary`, `lock`, or immutable data).
 
@@ -125,18 +149,20 @@ builder.Services.AddSingleton<ICacheService, InMemoryCacheService>();
 ### Visual Summary
 
 ```
-HTTP Request 1                HTTP Request 2
-┌──────────────────┐          ┌──────────────────┐
-│ Transient A (1)  │          │ Transient A (3)  │
-│ Transient A (2)  │          │ Transient A (4)  │
-│                  │          │                  │
-│ Scoped B (1)     │          │ Scoped B (2)     │
-│ Scoped B (1) ◄──── same    │ Scoped B (2) ◄──── same for this request
-│                  │          │                  │
-│ Singleton C (1)  │          │ Singleton C (1)  │
-│ Singleton C (1) ◄───────────── same across ALL requests
-└──────────────────┘          └──────────────────┘
+HTTP Request 1                           HTTP Request 2
+┌─────────────────────────────┐          ┌─────────────────────────────┐
+│ Transient A (Instance #1)   │          │ Transient A (Instance #3)   │
+│ Transient A (Instance #2)   │          │ Transient A (Instance #4)   │
+│                             │          │                             │
+│ Scoped B (Instance #1)      │          │ Scoped B (Instance #2)      │
+│ Scoped B (Instance #1) ◄────┼── Same   │ Scoped B (Instance #2) ◄────┼── Same for this request
+│                             │          │                             │
+│ Singleton C (Instance #1)   │          │ Singleton C (Instance #1)   │
+│ Singleton C (Instance #1) ◄─┴──────────┴─────────────────────────────┴── Shared across ALL requests
+└─────────────────────────────┘          └─────────────────────────────┘
 ```
+
+---
 
 ## 4. How to Register Services
 
@@ -155,7 +181,7 @@ builder.Services.AddTransient<PdfGenerator>();
 ```
 
 ### Factory Registration (Complex Creation Logic)
-When the constructor isn't enough:
+When construction requires dynamic branching or configuration inspection:
 ```csharp
 builder.Services.AddScoped<IPaymentGateway>(provider =>
 {
@@ -164,14 +190,16 @@ builder.Services.AddScoped<IPaymentGateway>(provider =>
     
     return environment == "Production"
         ? new StripePaymentGateway(config["Stripe:ApiKey"])
-        : new FakePaymentGateway(); // Use a fake in development
+        : new FakePaymentGateway(); // Use fake in development
 });
 ```
+
+---
 
 ## 5. How to Resolve (Consume) Services
 
 ### Constructor Injection — The Standard Way
-ASP.NET Core automatically examines your constructor, finds registered services matching the parameter types, and injects them.
+ASP.NET Core automatically examines your constructor, finds registered services matching parameter types, and injects them.
 
 ```csharp
 [ApiController]
@@ -182,8 +210,6 @@ public class OrdersController : ControllerBase
     private readonly IEmailSender _emailSender;
     private readonly ILogger<OrdersController> _logger;
 
-    // ASP.NET Core creates this controller, sees 3 dependencies,
-    // and automatically resolves all 3 from the DI container.
     public OrdersController(
         IOrderRepository repository,
         IEmailSender emailSender,
@@ -221,8 +247,7 @@ app.MapPost("/api/orders", async (
 ```
 
 ### `[FromServices]` — Inject Into a Specific Action
-When only one action method needs a service:
-
+When only one specific action method needs a heavy service:
 ```csharp
 [HttpGet("report")]
 public IActionResult GenerateReport([FromServices] IReportGenerator generator)
@@ -232,19 +257,17 @@ public IActionResult GenerateReport([FromServices] IReportGenerator generator)
 ```
 
 ### Manual Resolution with `IServiceProvider`
-For rare cases where you need to manually resolve (e.g., in background tasks or startup code):
-
+For startup code or background processing:
 ```csharp
 using var scope = app.Services.CreateScope();
 var repository = scope.ServiceProvider.GetRequiredService<IOrderRepository>();
 ```
 
+---
+
 ## 6. The Captive Dependency Trap ⚠️
 
-This is the **#1 DI mistake** I've seen in 25 years. It's subtle, dangerous, and often doesn't show up until production.
-
-### The Problem
-If you inject a **shorter-lived service** into a **longer-lived service**, the longer-lived service "captures" it, keeping it alive far beyond its intended lifetime.
+This is the **#1 DI architectural pitfall**. It occurs when a **longer-lived service captures a shorter-lived service**.
 
 ```csharp
 // ❌ DANGEROUS: Singleton captures a Scoped service
@@ -253,7 +276,7 @@ builder.Services.AddScoped<AppDbContext>(); // Scoped = one per request
 
 public class BackgroundProcessor : IBackgroundProcessor
 {
-    private readonly AppDbContext _dbContext; // Captured!
+    private readonly AppDbContext _dbContext; // ⚠️ Captured!
 
     public BackgroundProcessor(AppDbContext dbContext)
     {
@@ -262,20 +285,25 @@ public class BackgroundProcessor : IBackgroundProcessor
 }
 ```
 
-**What happens:** The `BackgroundProcessor` is created once (Singleton). It captures the `DbContext` that was meant to live for one request. Now that `DbContext` lives forever, accumulating tracked entities, holding stale database connections, and eventually causing memory leaks and data corruption.
+### What Happens in Production:
+1.  `BackgroundProcessor` is created once as a Singleton on startup.
+2.  It captures the `DbContext` that was meant to live for a single request.
+3.  **Memory Leak:** EF Core accumulates tracked entities in memory forever, eventually causing an Out-Of-Memory (OOM) crash.
+4.  **Multithreaded Crash:** When Request A and Request B call `BackgroundProcessor` simultaneously, both execute queries on the same `DbContext`. EF Core throws:  
+    `InvalidOperationException: A second operation was started on this context instance before a previous operation completed.`
+5.  **Tenant Data Contamination:** If a Singleton captures `ITenantContext`, Tenant B executes operations using Tenant A's cached tenant ID!
 
-### The Rule
-
+### The DI Container Rule:
 ```
-Transient  →  can depend on: Transient, Scoped, Singleton
-Scoped     →  can depend on: Scoped, Singleton
-Singleton  →  can depend on: Singleton ONLY
+Transient  ──▶  Can safely consume: Transient, Scoped, Singleton
+Scoped     ──▶  Can safely consume: Scoped, Singleton
+Singleton  ──▶  Can ONLY consume: Singleton
 ```
 
 > **Analogy:** A paper cup (Transient) can hold water from any source. A reusable bottle (Scoped) should only use filtered water. A water tower (Singleton) must only connect to the main supply — it can't depend on individual bottles that come and go.
 
-### The Fix: Manual Scoping
-When a Singleton needs Scoped services, create a manual scope:
+### The Fix: Manual Scoping via `IServiceScopeFactory`
+When a Singleton needs a Scoped service, inject `IServiceScopeFactory` and construct a manual scope:
 
 ```csharp
 public class BackgroundProcessor : IBackgroundProcessor
@@ -289,21 +317,26 @@ public class BackgroundProcessor : IBackgroundProcessor
 
     public async Task ProcessAsync()
     {
-        // Create a temporary scope just for this operation
+        // Create an explicit, temporary scope just for this operation
         using var scope = _scopeFactory.CreateScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-        // ... use dbContext safely, it will be disposed when scope ends
+        
+        // ... use dbContext safely ...
+        await dbContext.SaveChangesAsync();
+        // Disposed automatically when using block exits!
     }
 }
 ```
 
+---
+
 ## 7. Real-World DI Patterns from Your Projects
 
 ### 🏗️ NextEvent: Modular Service Registration
-NextEvent bundles DI registrations into **extension methods by architectural layer**. This keeps `Program.cs` scannable and makes each layer independently maintainable:
+NextEvent bundles DI registrations into **extension methods by architectural layer**. This keeps `Program.cs` scannable:
 
 ```csharp
-// From NextEvent's ApplicationServiceExtensions.cs
+// From NextEvent's API/Extensions/ApplicationServiceExtensions.cs
 public static class ApplicationServiceExtensions
 {
     public static IServiceCollection AddApplicationServices(this IServiceCollection services)
@@ -335,14 +368,8 @@ public static class ApplicationServiceExtensions
 }
 ```
 
-**Key patterns to notice:**
-*   `AddValidatorsFromAssemblyContaining<T>()` — Assembly scanning. Instead of manually registering every validator, it scans the assembly containing `T` and auto-registers all validators it finds.
-*   `AddHttpClient<TInterface, TImpl>()` — Typed HttpClient. Creates a dedicated `HttpClient` for `GeminiService`, preventing socket exhaustion issues.
-*   `AddSingleton<IDateTimeProvider>` — **Never use `DateTime.Now` directly.** Wrap it in an interface so you can freeze time in unit tests.
-*   `AddOpenBehavior(typeof(ValidationBehavior<,>))` — A generic pipeline behavior that intercepts every MediatR command and runs FluentValidation rules before the handler executes.
-
 ### 🏗️ NextEvent: Manual Scope for Database Seeding
-During application startup, the DI container hasn't created any HTTP request scopes yet. If you need a `DbContext` (which is Scoped), you must create a scope manually:
+During startup, no HTTP request scope exists. NextEvent creates a manual scope to migrate and seed:
 
 ```csharp
 // From NextEvent's Program.cs
@@ -367,7 +394,7 @@ catch (Exception ex)
 ```
 
 ### 🏗️ Normora: Scoped Tenant Context
-Normora registers `TenantContext` as **Scoped**, meaning each HTTP request gets its own isolated tenant state:
+Normora registers `TenantContext` as **Scoped**, ensuring each HTTP request gets its own isolated tenant state:
 
 ```csharp
 // From Normora's TenantContext.cs
@@ -389,10 +416,10 @@ public class TenantContext : ITenantContext
 }
 ```
 
-**Why Scoped?** Because the tenant must be isolated per-request. If it were Singleton, Request A from Tenant "Acme" would overwrite the context, and Request B from Tenant "Globex" would incorrectly see Acme's data. **Scoped guarantees each request gets its own clean `TenantContext` instance.**
+**Why Scoped?** If it were Singleton, Request A from Tenant "Acme" would overwrite the context, and Request B from Tenant "Globex" would see Acme's confidential data. **Scoped guarantees each request gets its own clean `TenantContext` instance.**
 
-### 🏗️ NextEvent: Abstracted Clock (IDateTimeProvider)
-One of the most overlooked DI patterns. Instead of calling `DateTime.UtcNow` directly:
+### 🏗️ NextEvent: Abstracted Clock (`IDateTimeProvider`)
+Instead of calling `DateTime.UtcNow` directly:
 
 ```csharp
 // Interface (in Shared project)
@@ -407,31 +434,99 @@ public class SystemDateTimeProvider : IDateTimeProvider
     public DateTime UtcNow => DateTime.UtcNow;
 }
 
-// In unit tests, you can freeze time:
+// In unit tests, freeze time deterministically:
 public class FakeDateTimeProvider : IDateTimeProvider
 {
-    public DateTime UtcNow { get; set; } = new(2026, 1, 1); // Always January 1st
+    public DateTime UtcNow { get; set; } = new(2026, 1, 1);
 }
 ```
 
-## 8. Best Practices Summary
+---
+
+## 8. Architectural Fitness Functions: Enforcing DI Invariants in CI/CD
+
+In **Normora**, the test suite `Normora.Architecture.Tests` programmatically inspects compiled assemblies during CI/CD to enforce architectural invariants:
+
+### Rule 1: Controllers Must NEVER Inject `DbContext` Directly
+```csharp
+// From Normora.Architecture.Tests/ModularMonolithArchitectureTests.cs
+[Fact]
+public void Controllers_MustNeverInject_DbContexts()
+{
+    var assemblies = new[] { ConversationsAssembly, DocumentsAssembly, TenantsAssembly };
+
+    var controllerTypes = assemblies
+        .SelectMany(a => a.GetTypes())
+        .Where(t => t.IsClass && !t.IsAbstract && typeof(ControllerBase).IsAssignableFrom(t))
+        .ToList();
+
+    Assert.NotEmpty(controllerTypes);
+
+    foreach (var controller in controllerTypes)
+    {
+        var constructors = controller.GetConstructors();
+        foreach (var ctor in constructors)
+        {
+            foreach (var param in ctor.GetParameters())
+            {
+                Assert.False(
+                    typeof(DbContext).IsAssignableFrom(param.ParameterType),
+                    $"Controller '{controller.FullName}' must not inject DbContext '{param.ParameterType.Name}'. " +
+                    $"Controllers must use MediatR contracts or module service abstractions.");
+            }
+        }
+    }
+}
+```
+
+### Rule 2: Entity Configurations Must Have Parameterless Constructors
+```csharp
+// From Normora.Architecture.Tests/ModularMonolithArchitectureTests.cs
+[Fact]
+public void EntityConfigurations_MustHaveParameterlessConstructors()
+{
+    var assemblies = new[] { ConversationsAssembly, DocumentsAssembly, TenantsAssembly };
+
+    var configTypes = assemblies
+        .SelectMany(a => a.GetTypes())
+        .Where(t => t.IsClass && !t.IsAbstract && t.GetInterfaces()
+            .Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IEntityTypeConfiguration<>)))
+        .ToList();
+
+    Assert.NotEmpty(configTypes);
+
+    foreach (var configType in configTypes)
+    {
+        var defaultCtor = configType.GetConstructor(Type.EmptyTypes);
+        Assert.True(
+            defaultCtor != null,
+            $"Entity configuration '{configType.FullName}' must have a parameterless constructor to allow auto-discovery via ApplyConfigurationsFromAssembly.");
+    }
+}
+```
+
+---
+
+## 9. Best Practices Summary
 
 | Practice | Why |
 |---|---|
 | **Program to interfaces, not implementations** | Swappable, testable, decoupled |
 | **Use Scoped for database contexts** | One connection per request, auto-disposed |
-| **Use Singleton only for thread-safe, stateless services** | Avoid race conditions |
-| **Never inject Scoped into Singleton** | Captive dependency → memory leaks |
+| **Use Singleton only for thread-safe services** | Protect concurrent requests from race conditions |
+| **Never inject Scoped into Singleton** | Captive dependency → memory leaks & concurrency crashes |
 | **Use `IServiceScopeFactory` in Singletons** | Create manual scopes safely |
 | **Group registrations into extension methods** | Clean `Program.cs`, maintainable code |
-| **Use Assembly Scanning** | Auto-discover validators, handlers, etc. |
-| **Abstract `DateTime.UtcNow` behind an interface** | Testable time-dependent code |
+| **Use Assembly Scanning** | Auto-discover validators, handlers, and mappings |
+| **Abstract `DateTime.UtcNow` behind an interface** | Enables pure, deterministic unit testing of time-based logic |
+| **Automate Architecture Tests** | Programmatically enforce DI and layer boundaries in CI/CD |
 
 ---
 **Key Takeaways:**
-1. DI removes the `new` keyword from your business logic — the container creates and manages everything.
-2. Lifetimes (Transient/Scoped/Singleton) determine how long instances live — get this wrong and you'll leak memory.
+1. DI removes the `new` keyword from your business logic — the container creates, provides, and manages everything.
+2. Lifetimes (Transient/Scoped/Singleton) determine how long instances live — get this wrong and you'll leak memory or crash under load.
 3. The Captive Dependency trap is the #1 DI pitfall — Singletons must never capture Scoped services.
 4. Real projects use extension methods, assembly scanning, and manual scoping.
+5. Senior architects use architecture tests to guarantee controllers never bypass CQRS or inject database contexts directly.
 
-**Next up:** Module 4 — **Routing and Endpoints**. How does ASP.NET Core look at a URL like `/api/events/42` and figure out which exact C# method to call?
+**Next up:** In [Module 4](04_Module_4_Routing_and_Endpoints.md), we explore **Routing and Endpoints** — how ASP.NET Core matches incoming URLs to C# actions and powers real-time WebSockets with SignalR.

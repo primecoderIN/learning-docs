@@ -1,19 +1,23 @@
-# Module 6: Model Binding and Validation
+# Module 6: Model Binding, Validation & CQRS Pipeline
 
 Your API receives raw HTTP data — bytes over the wire. A JSON body, query string parameters, URL segments, HTTP headers. Your C# code works with strongly-typed objects. **Model Binding** is the bridge between these two worlds. And **Validation** is the guard that ensures the data is sane before your business logic touches it.
+
+In enterprise software architecture, validation must be **isolated, automated, and testable**. This module demonstrates how to implement model binding, compare DataAnnotations with FluentValidation, and integrate automated validation and audit logging directly into a **MediatR CQRS pipeline**.
+
+---
 
 ## 1. What is Model Binding?
 
 Model Binding is the **automatic process** by which ASP.NET Core reads incoming HTTP request data and converts it into C# method parameters and objects.
 
-> **Analogy — The Mail Room:**
+> **Analogy — The Mail Room:**  
 > Imagine your office receives packages (HTTP requests). Each package has a shipping label (URL), a customs form (headers), and contents inside the box (body). The mail room (Model Binder) reads all of these, assembles the information into a structured internal form (C# object), and delivers it to the right department (Controller action).
 
 ### Before Model Binding (Manual Parsing)
 ```csharp
 // ❌ Without model binding — Painful, error-prone
 [HttpPost]
-public IActionResult CreateUser()
+public async Task<IActionResult> CreateUser()
 {
     var body = await new StreamReader(Request.Body).ReadToEndAsync();
     var json = JsonSerializer.Deserialize<Dictionary<string, object>>(body);
@@ -32,8 +36,11 @@ public IActionResult CreateUser(CreateUserDto dto)
 {
     // 'dto' is already populated with data from the JSON body!
     // ASP.NET Core did all the parsing, deserializing, and type conversion.
+    return Ok(dto);
 }
 ```
+
+---
 
 ## 2. Binding Sources — Where Data Comes From
 
@@ -52,7 +59,7 @@ HTTP requests carry data in **multiple places**. ASP.NET Core can read from all 
 
 | Attribute | Source | Use Case |
 |---|---|---|
-| `[FromForm]` | Form-encoded body | File uploads, HTML forms |
+| `[FromForm]` | Form-encoded body | File uploads, multipart forms |
 | `[FromServices]` | DI container | Inject a service into a specific action only |
 
 ### How `[ApiController]` Changes the Rules
@@ -62,17 +69,17 @@ When a controller is annotated with `[ApiController]`, ASP.NET Core applies **in
 |---|---|
 | Simple types (`int`, `string`, `Guid`) | `[FromRoute]` if a matching route parameter exists, otherwise `[FromQuery]` |
 | Complex types (classes, records) | `[FromBody]` |
-| `IFormFile` | `[FromForm]` |
-| `CancellationToken` | Special — injected by the framework |
+| `IFormFile` or `IFormFileCollection` | `[FromForm]` |
+| `CancellationToken` | Injected automatically by the framework |
 
 This means:
 ```csharp
 [ApiController]
-[Route("api/[controller]")]
+[Route("api/users")]
 public class UsersController : ControllerBase
 {
     // ASP.NET Core automatically infers:
-    //   - 'role' comes from the route (because it matches {role})
+    //   - 'role' comes from the route (matches {role})
     //   - 'sendEmail' comes from the query string (simple type, no route match)
     //   - 'dto' comes from the JSON body (complex type)
     [HttpPost("{role}")]
@@ -81,24 +88,25 @@ public class UsersController : ControllerBase
         // role = "admin" (from /api/users/admin)
         // sendEmail = true (from ?sendEmail=true)
         // dto = { Name: "Alice", Email: "alice@test.com" } (from JSON body)
+        return Ok();
     }
 }
 ```
 
-### Explicit Binding (When You Need Control)
-Sometimes inference guesses wrong. Explicitly specify the source:
-
+### Explicit Binding (When You Need Explicit Contracts)
 ```csharp
 [HttpPost("{role}")]
 public IActionResult CreateUser(
-    [FromRoute]  string role,              // From URL: /api/users/admin
-    [FromQuery]  bool sendEmail,           // From query: ?sendEmail=true
-    [FromBody]   CreateUserDto dto,        // From JSON body
-    [FromHeader(Name = "X-Request-Id")] string requestId)  // From HTTP header
+    [FromRoute]  string role,                               // From URL: /api/users/admin
+    [FromQuery]  bool sendEmail,                            // From query: ?sendEmail=true
+    [FromBody]   CreateUserDto dto,                         // From JSON body
+    [FromHeader(Name = "X-Request-Id")] string requestId)   // From HTTP header
 {
-    // ...
+    return Ok();
 }
 ```
+
+---
 
 ## 3. What is Validation? (And Why It's Non-Negotiable)
 
@@ -106,249 +114,274 @@ public IActionResult CreateUser(
 Every byte of data coming from the internet is potentially malicious or malformed. A client could send:
 *   An empty username
 *   A negative age
-*   A SQL injection in the email field
-*   A 50MB string where a name should be
+*   A SQL injection payload in an email field
+*   A 50MB string where a short title should be
 
-**Validation** ensures that incoming data meets your rules **before** it reaches your business logic.
+**Validation** ensures that incoming data meets business rules **before** it touches your core domain logic.
 
-> **Analogy — The Bouncer at a Club:**
-> Your business logic is the VIP section. The bouncer (validator) stands at the door checking everyone's ID. No ID? You're not getting in. Fake ID? Rejected. Under 18? Go home. Only verified guests enter the VIP area.
+> **Analogy — The Bouncer at a Club:**  
+> Your business logic is the VIP section. The bouncer (validator) stands at the velvet rope. He checks ID, dress code, and guest list *before* anyone enters. If you don't meet the rules, you are turned away at the door (400 Bad Request) — you never enter the club.
 
-## 4. Data Annotations — The Built-in Approach
+---
 
-Data Annotations are attributes you place directly on your DTO (Data Transfer Object) properties.
+## 4. Approach 1: Data Annotations (Trivial Validation)
+
+DataAnnotations use C# attributes directly on DTO properties:
 
 ```csharp
 public class CreateUserDto
 {
-    [Required(ErrorMessage = "Username is required")]
-    [StringLength(50, MinimumLength = 3, 
-        ErrorMessage = "Username must be between 3 and 50 characters")]
-    public string Username { get; set; } = string.Empty;
-
-    [Range(18, 120, ErrorMessage = "Age must be between 18 and 120")]
-    public int Age { get; set; }
+    [Required(ErrorMessage = "Name is required")]
+    [StringLength(50, MinimumLength = 2, ErrorMessage = "Name must be 2-50 characters")]
+    public string Name { get; set; } = string.Empty;
 
     [Required]
     [EmailAddress(ErrorMessage = "Invalid email format")]
     public string Email { get; set; } = string.Empty;
 
-    [Url(ErrorMessage = "Invalid URL format")]
-    public string? Website { get; set; }
-
-    [RegularExpression(@"^[A-Za-z0-9]+$", 
-        ErrorMessage = "Only alphanumeric characters allowed")]
-    public string? DisplayName { get; set; }
+    [Range(18, 120, ErrorMessage = "Must be between 18 and 120")]
+    public int Age { get; set; }
 }
 ```
 
-### Common Validation Attributes
-
+### Common Data Annotation Attributes:
 | Attribute | What it checks |
 |---|---|
-| `[Required]` | Value is not null or empty |
-| `[StringLength(max, MinimumLength)]` | String length within range |
-| `[Range(min, max)]` | Numeric value within range |
-| `[EmailAddress]` | Valid email format |
-| `[Url]` | Valid URL format |
-| `[Phone]` | Valid phone number format |
-| `[RegularExpression(pattern)]` | Matches a regex pattern |
-| `[Compare("OtherProperty")]` | Two properties match (e.g., Password confirmation) |
-| `[CreditCard]` | Valid credit card number (Luhn algorithm) |
+| `[Required]` | Value is not null, empty, or whitespace |
+| `[StringLength(max, MinimumLength = min)]` | String length is within bounds |
+| `[Range(min, max)]` | Numeric value is within bounds |
+| `[EmailAddress]` | String matches standard email format |
+| `[RegularExpression(pattern)]` | String matches custom regex |
+| `[Compare("OtherProperty")]` | Two properties match (e.g., password confirmation) |
 
-### Automatic 400 Bad Request (The Magic of `[ApiController]`)
-When you use `[ApiController]`, ASP.NET Core **automatically validates** the model before your action runs. If validation fails, a `400 Bad Request` is returned immediately — your action method **never executes**.
+### Limitations of Data Annotations:
+1.  **Pollutes DTOs:** Validation logic is coupled to the data transfer object.
+2.  **No Complex Logic:** Conditional rules (*"If payment method is CreditCard, Cvv is required"*) become an unreadable mess of custom attributes.
+3.  **Cannot Query External Services:** Attributes cannot easily perform async queries (e.g., checking if an email is already registered in PostgreSQL).
+4.  **Difficult to Unit Test:** Testing requires instantiating validation contexts rather than pure unit tests.
 
-**The automatic error response:**
-```json
-{
-  "type": "https://tools.ietf.org/html/rfc7231#section-6.5.1",
-  "title": "One or more validation errors occurred.",
-  "status": 400,
-  "errors": {
-    "Username": ["Username is required", "Username must be between 3 and 50 characters"],
-    "Age": ["Age must be between 18 and 120"],
-    "Email": ["Invalid email format"]
-  }
-}
-```
+---
 
-### Without `[ApiController]` (Manual Checking)
-In older MVC apps or when you don't use `[ApiController]`:
-```csharp
-[HttpPost]
-public IActionResult Create(CreateUserDto dto)
-{
-    if (!ModelState.IsValid)  // Manual check!
-    {
-        return BadRequest(ModelState);
-    }
-    // ... business logic
-}
-```
+## 5. Approach 2: FluentValidation (Enterprise Standard)
 
-## 5. FluentValidation — The Enterprise Approach
-
-### Why Not Just Use Data Annotations?
-Data Annotations work, but they have drawbacks in large codebases:
-
-1. **Cluttered models** — Your clean DTO class gets buried under attributes.
-2. **No conditional logic** — You can't say "Email is required only if ContactMethod == Email."
-3. **Can't inject services** — What if validation needs to check the database (e.g., "is this email already taken")?
-4. **Hard to unit test** — Annotations are tested by the framework, not by you.
-
-### FluentValidation: Separate Validator Classes
-FluentValidation moves all validation logic into dedicated classes:
+**FluentValidation** decouples validation into dedicated, strongly-typed validator classes.
 
 ```csharp
-public class CreateUserValidator : AbstractValidator<CreateUserDto>
-{
-    public CreateUserValidator()
-    {
-        RuleFor(x => x.Username)
-            .NotEmpty().WithMessage("Username is required")
-            .Length(3, 50).WithMessage("Username must be between 3 and 50 characters");
+// Clean DTO
+public record CreateUserDto(string Name, string Email, int Age, string ContactMethod, string? Phone);
 
-        RuleFor(x => x.Age)
-            .InclusiveBetween(18, 120);
+// Dedicated Validator Class
+public class CreateUserDtoValidator : AbstractValidator<CreateUserDto>
+{
+    public CreateUserDtoValidator()
+    {
+        RuleFor(x => x.Name)
+            .NotEmpty().WithMessage("Name is required")
+            .Length(2, 50).WithMessage("Name must be 2-50 characters");
 
         RuleFor(x => x.Email)
-            .NotEmpty()
-            .EmailAddress();
-    }
-}
-```
-
-### Conditional Validation (FluentValidation's Superpower)
-```csharp
-public class CreateUserValidator : AbstractValidator<CreateUserDto>
-{
-    public CreateUserValidator()
-    {
-        RuleFor(x => x.Email)
-            .NotEmpty()
-            .EmailAddress()
-            .When(x => x.ContactMethod == "Email");  // Only validate email if method is Email!
+            .NotEmpty().WithMessage("Email is required")
+            .EmailAddress().WithMessage("Invalid email format")
+            .When(x => x.ContactMethod == "Email"); // Conditional rule!
 
         RuleFor(x => x.Phone)
-            .NotEmpty()
+            .NotEmpty().WithMessage("Phone is required when contact method is Phone")
             .When(x => x.ContactMethod == "Phone");
+
+        RuleFor(x => x.Age)
+            .InclusiveBetween(18, 120).WithMessage("Age must be between 18 and 120");
     }
 }
 ```
 
 ### Database-Dependent Validation (Injecting Services)
+Because validators are standard classes registered in the DI container, they can inject database repositories or services:
+
 ```csharp
-public class CreateUserValidator : AbstractValidator<CreateUserDto>
+public class RegisterCommandValidator : AbstractValidator<RegisterCommand>
 {
-    public CreateUserValidator(IUserRepository repository)  // DI works here!
+    public RegisterCommandValidator(IUserRepository repository)
     {
         RuleFor(x => x.Email)
-            .MustAsync(async (email, cancellation) =>
+            .NotEmpty()
+            .MustAsync(async (email, ct) =>
             {
-                var exists = await repository.EmailExistsAsync(email);
-                return !exists;  // Must return true to pass validation
+                var exists = await repository.EmailExistsAsync(email, ct);
+                return !exists; // Must return true to pass validation
             })
-            .WithMessage("This email is already registered");
+            .WithMessage("This email address is already registered.");
     }
 }
 ```
 
-## 6. The MediatR + FluentValidation Pipeline
+---
 
-In architectures that use **CQRS (Command Query Responsibility Segregation)**, the Controller doesn't validate directly. Instead, a **Pipeline Behavior** intercepts every command before it reaches the handler.
+## 6. The MediatR Pipeline Behavior Pattern
 
-### How It Works
+In Clean Architecture and Modular Monoliths, controllers do not perform validation. Instead, a **MediatR Pipeline Behavior** intercepts every command and query before it reaches the handler.
 
 ```
-HTTP Request → Controller → MediatR → [ValidationBehavior] → Command Handler
-                                           ↓
-                                    Runs FluentValidation
-                                           ↓
-                                    If invalid → throws ValidationException
-                                    If valid → continues to handler
+HTTP Request → Controller → MediatR → [ValidationBehavior] → [AuditBehavior] → Command Handler
+                                            ↓
+                                     Runs FluentValidation
+                                            ↓
+                                     If invalid → throws ValidationException
+                                     If valid → continues down pipeline
 ```
 
-### The Validation Pipeline Behavior
+### The Production `ValidationBehavior`:
+
+Here is the exact implementation used in **Normora** and **NextEvent**:
+
 ```csharp
-public class ValidationBehavior<TRequest, TResponse> 
+// From Normora.Shared/ValidationBehavior.cs
+using FluentValidation;
+using MediatR;
+
+namespace Normora.Shared;
+
+public sealed class ValidationBehavior<TRequest, TResponse>(
+    IEnumerable<IValidator<TRequest>> validators) 
     : IPipelineBehavior<TRequest, TResponse>
+    where TRequest : notnull
 {
-    private readonly IEnumerable<IValidator<TRequest>> _validators;
-
-    public ValidationBehavior(IEnumerable<IValidator<TRequest>> validators)
-    {
-        _validators = validators;
-    }
-
     public async Task<TResponse> Handle(
         TRequest request,
         RequestHandlerDelegate<TResponse> next,
         CancellationToken cancellationToken)
     {
-        // 1. Run ALL registered validators for this request type
+        // 1. If no validators are registered for this request, pass through immediately
+        if (!validators.Any())
+        {
+            return await next();
+        }
+
         var context = new ValidationContext<TRequest>(request);
-        var failures = _validators
-            .Select(v => v.Validate(context))
-            .SelectMany(result => result.Errors)
+
+        // 2. Execute all validators asynchronously in parallel
+        var validationResults = await Task.WhenAll(
+            validators.Select(v => v.ValidateAsync(context, cancellationToken)));
+
+        // 3. Aggregate failures across all validator classes
+        var failures = validationResults
+            .SelectMany(r => r.Errors)
             .Where(f => f != null)
             .ToList();
 
-        // 2. If any fail, throw — the ExceptionMiddleware catches this
-        if (failures.Count > 0)
+        // 4. If any validation rules fail, throw ValidationException
+        if (failures.Count != 0)
+        {
             throw new ValidationException(failures);
+        }
 
-        // 3. If all pass, continue to the actual handler
+        // 5. All validation passed — continue to the actual Command Handler
         return await next();
     }
 }
 ```
 
-### 🏗️ Real-World: NextEvent's Registration
+### The Controller in a CQRS Pipeline:
 ```csharp
-// From NextEvent's ApplicationServiceExtensions.cs
-services.AddMediatR(x =>
-{
-    x.RegisterServicesFromAssemblyContaining<LoginCommandHandler>();
-
-    // This single line bridges FluentValidation and MediatR:
-    x.AddOpenBehavior(typeof(ValidationBehavior<,>));
-});
-```
-
-**The beauty:** Your controllers become incredibly thin — they just forward commands to MediatR. Validation happens automatically via the pipeline. The `ExceptionMiddleware` catches `ValidationException` and returns a clean `400 Bad Request`.
-
-```csharp
-// A controller in a CQRS architecture — no validation logic at all!
 [HttpPost]
-public async Task<IActionResult> Register(RegisterCommand command)
+public async Task<IActionResult> Register(RegisterCommand command, CancellationToken ct)
 {
-    var result = await _mediator.Send(command);
+    // The controller contains ZERO validation boilerplate!
+    var result = await _mediator.Send(command, ct);
     return Ok(result);
-    // If command is invalid, ValidationBehavior throws ValidationException
-    // ExceptionMiddleware catches it and returns 400 Bad Request
-    // This code NEVER executes if validation fails
+    // If command is invalid, ValidationBehavior throws ValidationException.
+    // The global exception handler intercepts it and returns 400 Bad Request.
+    // This action never executes with invalid data!
 }
 ```
 
-## 7. Best Practices Summary
+---
+
+## 7. Cross-Cutting Pipeline Behaviors: The `AuditBehavior`
+
+In **Normora**, any command mutating system state must record an immutable audit log. Rather than adding audit logging code inside every single command handler, Normora implements an **`AuditBehavior`**:
+
+```csharp
+// From Normora.Shared/AuditBehavior.cs
+public sealed class AuditBehavior<TRequest, TResponse>(
+    ILogger<AuditBehavior<TRequest, TResponse>> logger,
+    ICurrentUser currentUser,
+    ITenantContext tenantContext) 
+    : IPipelineBehavior<TRequest, TResponse>
+    where TRequest : notnull
+{
+    public async Task<TResponse> Handle(
+        TRequest request,
+        RequestHandlerDelegate<TResponse> next,
+        CancellationToken cancellationToken)
+    {
+        var requestName = typeof(TRequest).Name;
+
+        // Execute the command
+        var response = await next();
+
+        // If the command mutates state, record the audit entry
+        if (requestName.EndsWith("Command", StringComparison.Ordinal))
+        {
+            logger.LogInformation(
+                "Audit: Action {CommandName} executed by User {UserId} in Tenant {TenantId}",
+                requestName,
+                currentUser.ExternalUserId ?? "System",
+                tenantContext.TenantId);
+        }
+
+        return response;
+    }
+}
+```
+
+---
+
+## 8. Wiring Behaviors via Assembly Scanning
+
+In your Composition Root (`ApplicationServiceExtensions.cs`), auto-discover validators and wire the pipeline:
+
+```csharp
+// From NextEvent's ApplicationServiceExtensions.cs
+public static IServiceCollection AddApplicationServices(this IServiceCollection services)
+{
+    // Scan assemblies and auto-register all FluentValidation validators
+    services.AddValidatorsFromAssemblyContaining<RegisterCommandValidator>();
+
+    // Register MediatR with pipeline behaviors
+    services.AddMediatR(cfg =>
+    {
+        cfg.RegisterServicesFromAssemblyContaining<LoginCommandHandler>();
+
+        // Behaviors execute in the sequential order registered:
+        cfg.AddOpenBehavior(typeof(ValidationBehavior<,>)); // 1. Validate inputs
+        cfg.AddOpenBehavior(typeof(AuditBehavior<,>));      // 2. Audit execution
+    });
+
+    return services;
+}
+```
+
+---
+
+## 9. Best Practices Summary
 
 | Practice | Why |
 |---|---|
-| **Always use `[ApiController]`** | Automatic validation, binding inference, Problem Details |
-| **Use DTOs, not Domain Entities** | Don't expose internal models to the outside world |
-| **Prefer FluentValidation over Data Annotations** | Testable, injectable, conditional rules |
-| **Use a `ValidationBehavior` with MediatR** | Automatic, centralized, no manual checks |
-| **Always validate on the server** | Client-side validation is a UX feature, not a security feature |
-| **Use `[FromRoute]` for identifiers** | Clean URLs: `/api/users/42` |
-| **Use `[FromQuery]` for filters/pagination** | Standard: `?page=2&size=10&sort=name` |
-| **Use `[FromBody]` for create/update payloads** | POST/PUT with JSON |
+| **Always use `[ApiController]`** | Automatic validation inference, binding rules, Problem Details |
+| **Use DTOs, not Domain Entities** | Never expose internal database entities to external clients |
+| **Prefer FluentValidation over Data Annotations** | Testable, injectable, supports conditionals and async rules |
+| **Use a `ValidationBehavior` with MediatR** | Centralized validation before any business handler runs |
+| **Always validate on the server** | Client-side validation is a UX feature, not a security boundary |
+| **Use `[FromRoute]` for identifiers** | Clean, RESTful URLs: `/api/users/42` |
+| **Use `[FromQuery]` for filters/pagination** | Standard URI query strings: `?page=2&pageSize=10` |
+| **Use `[FromBody]` for command payloads** | Deserializes JSON payloads into strongly-typed commands |
+| **Implement Cross-Cutting Audit Behaviors** | Record mutation telemetry centrally without cluttering handlers |
 
 ---
 **Key Takeaways:**
 1. Model Binding automatically converts HTTP data into C# objects — you rarely need to parse anything manually.
-2. `[ApiController]` enables automatic validation, returning 400 before your code runs.
+2. `[ApiController]` enables automatic binding inference and model validation.
 3. FluentValidation is the enterprise standard — it separates validation from models and supports DI, conditionals, and async rules.
-4. In CQRS architectures, validation runs in a MediatR pipeline behavior, keeping controllers razor-thin.
+4. In CQRS architectures, validation runs in a MediatR pipeline behavior, keeping controllers razor-thin and business handlers protected.
 
-**Next up:** Module 7 — **Error Handling and Logging**. What happens when things go wrong? How do you log what happened and return safe, standardized error responses?
+**Next up:** In [Module 7](07_Module_7_Error_Handling.md), we explore **Error Handling and Logging** — how to record structured logs, adopt .NET 8+ `IExceptionHandler`, and prevent sensitive technical data leaks.

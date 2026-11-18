@@ -1,6 +1,8 @@
-# Module 5: Configuration and the Options Pattern
+# Module 5: Configuration, the Options Pattern & Cloud Secrets
 
-Every real-world application needs settings that change based on where it runs. Your development machine uses `localhost:5432` for the database; production uses `prod-db.company.com:5432`. Your local environment uses a test API key; production uses the real one. **Configuration** is the system that manages these values, and ASP.NET Core has one of the most sophisticated configuration systems of any web framework.
+Every real-world application needs settings that change based on where it runs. Your development machine uses `localhost:5432` for the database; production uses `prod-db.company.com:5432`. Your local environment uses a test API key; production uses the real one. **Configuration** is the system that manages these values, and ASP.NET Core has one of the most sophisticated, extensible configuration systems of any modern web framework.
+
+---
 
 ## 1. What is Configuration?
 
@@ -8,30 +10,32 @@ Configuration is **externalized data** that your application reads at runtime to
 
 Examples of configuration:
 *   Database connection strings
-*   Third-party API keys (Stripe, SendGrid, Gemini)
-*   Feature flags (enable/disable features)
+*   Third-party API keys (Stripe, SendGrid, Gemini AI)
+*   Feature flags (enable/disable features dynamically)
 *   Logging verbosity levels
 *   CORS allowed origins
 *   JWT token signing keys
 
-> **Analogy — The Car Dashboard:**
+> **Analogy — The Car Dashboard:**  
 > Your car's engine (application code) is the same whether you're driving in the city or on the highway. But the dashboard settings (configuration) change — you adjust the AC, the mirrors, and the seat position. You don't rebuild the engine to change these.
+
+---
 
 ## 2. The Hierarchical Configuration Model
 
 ### How It Works
-ASP.NET Core doesn't load configuration from a single source. It layers **multiple sources** on top of each other. When the same key exists in multiple sources, the **last one loaded wins** (overrides).
+ASP.NET Core does not read configuration from a single source. It layers **multiple sources** on top of each other. When the same key exists in multiple sources, the **last one loaded wins** (overrides).
 
 `WebApplication.CreateBuilder(args)` sets up these sources **in this order:**
 
 ```
-Priority (lowest → highest):
+PRIORITY LADDER (Lowest → Highest):
 
-1. appsettings.json                    ← Base defaults
-2. appsettings.{Environment}.json      ← Environment overrides
+1. appsettings.json                    ← Base defaults for all environments
+2. appsettings.{Environment}.json      ← Environment overrides (e.g. Development)
 3. User Secrets                        ← Local dev secrets (NOT in Git)
-4. Environment Variables               ← Server/Docker/Cloud
-5. Command-line arguments              ← Highest priority
+4. Environment Variables               ← Server / Docker / Kubernetes cloud secrets
+5. Command-line arguments              ← Highest priority (Overrides everything)
 ```
 
 ### Why This Layered Model is Brilliant
@@ -48,13 +52,15 @@ The same application binary works in every environment without recompilation. Th
 
 ### Environment Names
 ASP.NET Core uses the `ASPNETCORE_ENVIRONMENT` environment variable to determine the current environment. The three standard names are:
-*   **Development** — Your local machine. Enables detailed error pages, Swagger, hot-reload.
+*   **Development** — Your local machine. Enables detailed error pages, Scalar/Swagger docs, hot-reload.
 *   **Staging** — Pre-production environment for testing.
-*   **Production** — The live environment. Enables HTTPS enforcement, optimized logging, error hiding.
+*   **Production** — The live environment. Enables HTTPS enforcement, optimized logging, error shielding.
+
+---
 
 ## 3. The Configuration Sources in Detail
 
-### `appsettings.json` — The Base
+### `appsettings.json` — The Base Defaults
 ```json
 {
   "Logging": {
@@ -88,151 +94,140 @@ Only loaded when `ASPNETCORE_ENVIRONMENT=Development`:
 ```
 
 ### User Secrets — Local Secrets (Never Committed to Git)
-For sensitive data during development:
+For sensitive data during local development:
 ```bash
-# Store a secret (stored in your user profile, NOT in the project folder)
-dotnet user-secrets set "PaymentGateway:ApiKey" "sk_live_real_key_here"
+# Initialize and store a secret (stored in your OS user profile, NOT in the repo)
+dotnet user-secrets init
+dotnet user-secrets set "PaymentGateway:ApiKey" "sk_test_secret_key_here"
 ```
 
-**Why?** Because `appsettings.json` is committed to Git. If you put a real API key there, it's visible to everyone with repository access. User Secrets are stored in your OS user profile directory, completely outside the project folder.
+**Why?** Because `appsettings.json` is committed to Git. If you put a real API key or password there, it is visible to everyone with repository access. User Secrets are stored outside the project folder.
 
-### Environment Variables — The Production Standard
-In production (Docker, Kubernetes, Azure, AWS), you inject configuration via environment variables. ASP.NET Core automatically reads them.
+### Environment Variables — The Production & Container Standard
+In production (Docker, Kubernetes, Azure, AWS), you inject configuration via environment variables:
 
 ```bash
-# In Docker Compose or Kubernetes config:
-ConnectionStrings__DefaultConnection=Server=prod-db;Database=MyApp;Password=s3cret;
+# In Docker Compose or Kubernetes deployment manifests:
+ConnectionStrings__DefaultConnection=Server=prod-db.internal;Database=MyApp;Password=s3cret;
 PaymentGateway__ApiKey=sk_live_production_key
 ```
 
-Note the **double underscore `__`** — it replaces the colon `:` used in JSON nesting. `PaymentGateway__ApiKey` maps to `PaymentGateway:ApiKey` in configuration.
+Note the **double underscore `__`** — it replaces the colon `:` used in JSON nesting because Linux shells cannot parse colons in variable names. `PaymentGateway__ApiKey` automatically maps to `PaymentGateway:ApiKey`.
+
+---
 
 ## 4. Reading Configuration — The Raw Way (And Why It's Bad)
 
-### Using `IConfiguration` Directly
+### Using `IConfiguration` Directly (The Anti-Pattern)
 ```csharp
-public class PaymentsController : ControllerBase
+// ❌ RAW ICONFIGURATION ANTI-PATTERN
+public class PaymentService
 {
-    private readonly IConfiguration _config;
+    private readonly IConfiguration _configuration;
 
-    public PaymentsController(IConfiguration config) => _config = config;
-
-    [HttpGet]
-    public IActionResult GetConfig()
+    public PaymentService(IConfiguration configuration)
     {
-        var apiKey = _config["PaymentGateway:ApiKey"];          // Magic string!
-        var timeout = int.Parse(_config["PaymentGateway:TimeoutSeconds"]); // Manual parsing!
-        
-        return Ok(new { apiKey, timeout });
+        _configuration = configuration;
+    }
+
+    public void ProcessPayment()
+    {
+        // 1. Magic strings: Typos compile successfully but fail at runtime!
+        var apiKey = _configuration["PaymentGateway:ApiKey"];
+
+        // 2. Manual parsing: Fragile type conversions
+        var timeout = int.Parse(_configuration["PaymentGateway:TimeoutSeconds"] ?? "30");
+        var retries = int.Parse(_configuration["PaymentGateway:RetryCount"] ?? "3");
     }
 }
 ```
 
-**What's wrong with this?**
-1. **Magic strings** — `"PaymentGateway:ApiKey"` has no compile-time checking. Typo? Silent `null` at runtime.
-2. **Manual parsing** — You must convert `"30"` to `int` yourself. Miss it? Runtime crash.
-3. **No IntelliSense** — Your IDE can't help you discover available config keys.
-4. **Scattered access** — Every class that needs config reads it differently. No single source of truth.
-5. **Hard to test** — How do you mock `IConfiguration` in unit tests? It's painful.
+### Why Raw `IConfiguration` Fails Enterprise Standards:
+*   **No Type Safety:** Everything is retrieved as an untyped string.
+*   **No IntelliSense:** You have to guess or remember exact JSON property names.
+*   **No Validation:** If a key is missing, you get `null`, leading to a `NullReferenceException` deep in production.
+*   **Scattered Secrets:** Configuration paths are hardcoded across dozens of business classes.
 
-## 5. The Options Pattern — The Professional Way
+---
 
-The Options Pattern solves every problem above by **binding configuration sections to strongly-typed C# classes**.
+## 5. The Options Pattern: Strongly-Typed Configuration
 
-### Step 1: Define the Options Class
-Create a plain C# class (a POCO) whose properties match the JSON structure:
+The **Options Pattern** binds JSON configuration sections directly to plain C# classes (POCOs).
 
+### Step 1: Create the Options Class
 ```csharp
-public class PaymentOptions
+public class PaymentGatewayOptions
 {
-    // These property names must EXACTLY match the JSON keys
+    public const string SectionName = "PaymentGateway";
+
     public string ApiKey { get; set; } = string.Empty;
-    public int TimeoutSeconds { get; set; } = 30;  // Default value!
+    public int TimeoutSeconds { get; set; } = 30;
     public int RetryCount { get; set; } = 3;
 }
 ```
 
-### Step 2: Bind in Program.cs
-Tell the DI container to map the `"PaymentGateway"` JSON section to the `PaymentOptions` class:
-
+### Step 2: Register in Program.cs
 ```csharp
-builder.Services.Configure<PaymentOptions>(
-    builder.Configuration.GetSection("PaymentGateway"));
+// Binds the "PaymentGateway" section of appsettings.json to PaymentGatewayOptions
+builder.Services.Configure<PaymentGatewayOptions>(
+    builder.Configuration.GetSection(PaymentGatewayOptions.SectionName));
 ```
 
-### Step 3: Inject `IOptions<T>`
+### Step 3: Inject `IOptions<T>` into Your Service
 ```csharp
-public class PaymentsController : ControllerBase
+// ✅ CLEAN, STRONGLY-TYPED INJECTION
+public class PaymentService
 {
-    private readonly PaymentOptions _options;
+    private readonly PaymentGatewayOptions _options;
 
-    public PaymentsController(IOptions<PaymentOptions> options)
+    public PaymentService(IOptions<PaymentGatewayOptions> options)
     {
-        _options = options.Value;  // Access the bound object
+        _options = options.Value; // Strongly-typed, verified, IntelliSense-enabled!
     }
 
-    [HttpPost("charge")]
-    public IActionResult Charge(ChargeDto dto)
+    public void ProcessPayment()
     {
-        // ✅ Strongly typed! IntelliSense! Compile-time safety!
-        var client = new PaymentClient(_options.ApiKey, _options.TimeoutSeconds);
-        client.Charge(dto.Amount);
-        return Ok();
+        var apiKey = _options.ApiKey;
+        var timeout = _options.TimeoutSeconds; // Already an int! No parsing needed.
     }
 }
 ```
 
-### Step 4 (Advanced): Validation on Startup
-You can validate your configuration at startup to fail fast if required values are missing:
+---
 
-```csharp
-builder.Services.AddOptions<PaymentOptions>()
-    .Bind(builder.Configuration.GetSection("PaymentGateway"))
-    .ValidateDataAnnotations()  // Use [Required], [Range], etc. on the Options class
-    .ValidateOnStart();         // Crash at startup if validation fails
-```
+## 6. The Options Trinity: `IOptions` vs. `IOptionsSnapshot` vs. `IOptionsMonitor`
 
+ASP.NET Core provides three distinct interfaces to consume options:
+
+| Interface | Service Lifetime | Reads Changes at Runtime? | Injected into Singletons? | Best Use Case |
+|---|---|---|---|---|
+| **`IOptions<T>`** | **Singleton** | ❌ No (Reads once at startup) | ✅ **Yes** | Infrastructure (DB connections, Redis, AWS/Azure URLs) |
+| **`IOptionsSnapshot<T>`** | **Scoped** | ✅ **Yes** (Re-read per HTTP request) | ❌ **NO!** (Captive dependency hazard) | Per-request business rules, tenant feature flags |
+| **`IOptionsMonitor<T>`** | **Singleton** | ✅ **Yes** (Live push notifications) | ✅ **Yes** | Background workers, live-reloading Singleton services |
+
+### Using `IOptionsSnapshot<T>` for Live Reloading in Web Requests
 ```csharp
-public class PaymentOptions
+// Automatically re-reads configuration on every HTTP request
+public class DiscountService(IOptionsSnapshot<DiscountOptions> options)
 {
-    [Required(ErrorMessage = "PaymentGateway:ApiKey is required")]
-    public string ApiKey { get; set; } = string.Empty;
-
-    [Range(1, 120, ErrorMessage = "Timeout must be between 1 and 120 seconds")]
-    public int TimeoutSeconds { get; set; } = 30;
+    public decimal GetDiscount() => options.Value.CurrentPercentage;
 }
 ```
 
-## 6. IOptions vs IOptionsSnapshot vs IOptionsMonitor
-
-This is where most tutorials stop. But in real applications, you need to know **when** configuration values are read.
-
-| Interface | Lifetime | Reloads on change? | Use when... |
-|---|---|---|---|
-| `IOptions<T>` | Singleton | ❌ No — reads once at startup | Values that never change (JWT signing keys) |
-| `IOptionsSnapshot<T>` | Scoped | ✅ Yes — re-reads per request | Most web scenarios (connection strings, API keys) |
-| `IOptionsMonitor<T>` | Singleton | ✅ Yes — notifies on change | Singleton services that need live updates |
-
-### When Does Configuration Change?
-If you edit `appsettings.json` while the app is running:
-*   `IOptions<T>` — **Never sees the change.** It read the value at startup and cached it forever.
-*   `IOptionsSnapshot<T>` — **Sees the change on the next HTTP request.** Perfect for web apps.
-*   `IOptionsMonitor<T>` — **Sees the change immediately** via a callback. Used in Singleton services like background workers.
-
+### Using `IOptionsMonitor<T>` in Singletons & Background Workers
 ```csharp
-// IOptionsMonitor example — reacting to live config changes
-public class BackgroundWorker : BackgroundService
+public class PollingWorker : BackgroundService
 {
-    private readonly IOptionsMonitor<PaymentOptions> _optionsMonitor;
+    private readonly IOptionsMonitor<PaymentGatewayOptions> _optionsMonitor;
 
-    public BackgroundWorker(IOptionsMonitor<PaymentOptions> optionsMonitor)
+    public PollingWorker(IOptionsMonitor<PaymentGatewayOptions> optionsMonitor)
     {
         _optionsMonitor = optionsMonitor;
-        
-        // Register a callback that fires whenever the config file changes
+
+        // Register a callback for when configuration changes on disk:
         _optionsMonitor.OnChange(newOptions =>
         {
-            Console.WriteLine($"Config changed! New timeout: {newOptions.TimeoutSeconds}");
+            Console.WriteLine($"Config changed on disk! New timeout: {newOptions.TimeoutSeconds}");
         });
     }
 
@@ -240,7 +235,7 @@ public class BackgroundWorker : BackgroundService
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            // Always reads the LATEST value
+            // Always reads the LATEST value without app restart
             var currentTimeout = _optionsMonitor.CurrentValue.TimeoutSeconds;
             await Task.Delay(TimeSpan.FromSeconds(currentTimeout), stoppingToken);
         }
@@ -248,7 +243,46 @@ public class BackgroundWorker : BackgroundService
 }
 ```
 
-## 7. Real-World Configuration from Your Projects
+---
+
+## 7. Fail-Fast Startup Validation: `ValidateOnStart()`
+
+A fundamental rule of resilient software architecture is: **Fail Fast, Fail Loudly.**
+
+If an application is missing its database connection string, JWT signing secret, or third-party AI credentials, **the container must refuse to start**.
+
+### Implementing Startup Validation via DataAnnotations:
+```csharp
+public class KeycloakOptions
+{
+    public const string SectionName = "Keycloak";
+
+    [Required(ErrorMessage = "Keycloak Authority URL is mandatory.")]
+    [Url(ErrorMessage = "Keycloak Authority must be a valid URL.")]
+    public string Authority { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Keycloak ClientId is mandatory.")]
+    public string ClientId { get; set; } = string.Empty;
+
+    [Required(ErrorMessage = "Keycloak ClientSecret is mandatory.")]
+    public string ClientSecret { get; set; } = string.Empty;
+
+    [Range(1, 60, ErrorMessage = "TokenClockSkewSeconds must be between 1 and 60.")]
+    public int TokenClockSkewSeconds { get; set; } = 5;
+}
+```
+
+### Registering with `ValidateOnStart()`:
+```csharp
+builder.Services.AddOptions<KeycloakOptions>()
+    .Bind(builder.Configuration.GetSection(KeycloakOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart(); // 🛡️ Throws OptionsValidationException immediately during builder.Build()!
+```
+
+---
+
+## 8. Real-World Configuration from Your Projects
 
 ### 🏗️ NextEvent: Fail-Fast on Missing Connection String
 ```csharp
@@ -258,7 +292,7 @@ var connectionString = configuration.GetConnectionString("DefaultConnection")
         "Connection string 'DefaultConnection' was not found.");
 ```
 
-**Why throw immediately?** If the connection string is missing, every database operation will fail. Instead of discovering this on the first user request (which might be minutes later), crash at startup with a clear error message. This is the **Fail Fast** principle.
+**Why throw immediately?** If the connection string is missing, every database operation will fail. Crash at startup with a clear error message rather than failing minutes later under user load.
 
 ### 🏗️ NextEvent: Securing the JWT Token Key
 ```csharp
@@ -285,50 +319,72 @@ services.AddCors(options =>
 });
 ```
 
-**Why?** The same compiled binary runs in Development (`http://localhost:4200`) and Production (`https://app.nextevent.com`). The CORS origins are read from configuration, not hardcoded.
-
 ### 🏗️ NextEvent: Database Resilience Configuration
 ```csharp
 // From NextEvent's DatabaseServiceExtensions.cs
 options.UseSqlServer(connectionString, sqlOptions =>
 {
-    sqlOptions.MigrationsAssembly(migrationsAssembly);  // Module-specific migrations
+    sqlOptions.MigrationsAssembly(migrationsAssembly);
     sqlOptions.EnableRetryOnFailure(
         maxRetryCount: 5,                                // Retry 5 times
         maxRetryDelay: TimeSpan.FromSeconds(10),         // Wait up to 10s between retries
-        errorNumbersToAdd: null);                        // Retry on all transient errors
+        errorNumbersToAdd: null);                        // Retry on transient network blips
     sqlOptions.CommandTimeout(60);                       // 60-second query timeout
 });
 ```
 
-**Why `EnableRetryOnFailure`?** In cloud environments, database connections can briefly drop during failovers, scaling events, or network blips. Without retry logic, a single blip returns a 500 error. With retry logic, the query transparently retries and the user never notices.
+**Why `EnableRetryOnFailure`?** In cloud environments, database connections can briefly drop during failovers or network rebalancing. With retry logic, the query retries transparently and the user never experiences a 500 error.
 
-### 🏗️ Normora: Centralized Configuration Extension
+### 🏗️ Normora: Production `RedisOptions`
 ```csharp
-// From Normora's Program.cs
-builder.Services.AddConfigurationServices(builder.Configuration);
+// From Normora.Infrastructure/Options/RedisOptions.cs
+public class RedisOptions
+{
+    public const string SectionName = "Redis";
+    public const string EnvironmentVariable = "REDIS_CONNECTION";
+
+    public string? ConnectionString { get; set; }
+    public string InstanceName { get; set; } = "normora:";
+    public string ChannelPrefix { get; set; } = "normora:signalr";
+}
 ```
 
-Normora groups all `IOptions<T>` bindings (MinIO storage, Keycloak auth, OpenTelemetry, email settings) into a single extension method, keeping `Program.cs` clean.
+And verified via architecture tests:
+```csharp
+// From Normora.Architecture.Tests/ModularMonolithArchitectureTests.cs
+[Fact]
+public void RedisOptions_DefaultValues_AreStronglyTypedAndConsistent()
+{
+    var options = new Normora.Infrastructure.Options.RedisOptions();
 
-## 8. Best Practices Summary
+    Assert.Equal("Redis", Normora.Infrastructure.Options.RedisOptions.SectionName);
+    Assert.Equal("REDIS_CONNECTION", Normora.Infrastructure.Options.RedisOptions.EnvironmentVariable);
+    Assert.Equal("normora:signalr", options.ChannelPrefix);
+    Assert.Equal("normora:", options.InstanceName);
+    Assert.Null(options.ConnectionString);
+}
+```
+
+---
+
+## 9. Best Practices Summary
 
 | Practice | Why |
 |---|---|
 | **Never hardcode configuration values** | Use `appsettings.json` + environment variables |
 | **Use the Options Pattern, not raw `IConfiguration`** | Type safety, IntelliSense, testability |
-| **Use `IOptionsSnapshot<T>` for web apps** | Auto-reloads when config file changes |
-| **Validate options on startup (`.ValidateOnStart()`)** | Fail fast with clear errors |
-| **Store secrets in User Secrets (dev) / Env Vars (prod)** | Never commit passwords to Git |
+| **Use `IOptionsSnapshot<T>` for web apps** | Auto-reloads when config changes on disk |
+| **Validate options on startup (`.ValidateOnStart()`)** | Fail fast with clear errors before serving traffic |
+| **Store secrets in User Secrets (dev) / Env Vars (prod)** | Never commit passwords or private keys to Git |
 | **Throw on missing critical config** | `?? throw new InvalidOperationException(...)` |
-| **Use `EnableRetryOnFailure` for cloud databases** | Handle transient network failures |
-| **Load CORS origins from config** | Same binary, multiple environments |
+| **Use `EnableRetryOnFailure` for cloud databases** | Transparently handle transient network failures |
+| **Load CORS origins from config** | Same binary functions cleanly across dev, staging, and prod |
 
 ---
 **Key Takeaways:**
 1. Configuration is layered — `appsettings.json` → `appsettings.{Environment}.json` → User Secrets → Environment Variables. Last one wins.
 2. The Options Pattern binds JSON sections to C# classes for type safety and IntelliSense.
-3. Use `IOptionsSnapshot<T>` for live-reloading in web requests, `IOptionsMonitor<T>` for Singletons.
-4. Never store secrets in files committed to source control. Use User Secrets or environment variables.
+3. Use `IOptions<T>` for Singletons, `IOptionsSnapshot<T>` for web requests, and `IOptionsMonitor<T>` for live background workers.
+4. Enforce `.ValidateOnStart()` to guarantee missing cloud secrets halt container boot immediately.
 
-**Next up:** Module 6 — **Model Binding and Validation**. How does ASP.NET Core take a raw JSON body and magically turn it into a C# object? And how do you ensure that object contains valid data?
+**Next up:** In [Module 6](06_Module_6_Model_Binding.md), we explore **Model Binding and Validation** — how ASP.NET Core deserializes HTTP payloads and enforces clean CQRS pipeline validation.

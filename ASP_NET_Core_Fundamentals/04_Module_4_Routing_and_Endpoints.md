@@ -1,6 +1,10 @@
-# Module 4: Routing and Endpoints
+# Module 4: Routing, Endpoints, Minimal APIs & Real-Time SignalR
 
-Routing is the **GPS system** of your web application. When an HTTP request arrives at your server saying `GET /api/events/42/tickets`, routing is the mechanism that looks at that URL, decodes it, and says: "Ah, this request should be handled by the `GetTickets` method of the `EventsController`, and the `id` parameter is `42`."
+Routing is the **GPS and dispatch system** of your web application. When an HTTP request arrives at your server saying `GET /api/events/42/tickets`, routing is the mechanism that looks at that URL, decodes it, and determines: *"This request should be handled by the `GetTickets` method of the `EventsController`, and the `id` parameter is `42`."*
+
+For a software architect, routing is not just about string matching: it governs **RESTful API contracts, performance benchmarks, real-time bidirectional communication, defense-in-depth parameter constraints, and modern AI agent interfaces.**
+
+---
 
 ## 1. What is Routing?
 
@@ -9,25 +13,53 @@ Your ASP.NET Core application has dozens (or hundreds) of C# methods that handle
 
 That "something" is the **Router**.
 
-> **Analogy — The Post Office:**
+> **Analogy — The Post Office:**  
 > Think of routing like a post office. Letters (HTTP requests) arrive with an address (URL). The post office (router) reads the address, looks it up in its delivery registry, and dispatches the letter to the correct mailbox (C# method). If the address doesn't match any mailbox, the letter is returned with "Address Unknown" (404 Not Found).
 
 ### What Routing Does, Step by Step
 1. **Receives** an incoming URL: `GET /api/products/42`
 2. **Matches** it against all registered route templates: `"/api/products/{id:int}"`
 3. **Extracts** parameters: `id = 42`
-4. **Selects** the endpoint (the C# method to execute)
+4. **Selects** the endpoint (the C# method or delegate to execute)
 5. **Binds** the extracted values to the method's parameters
 
-## 2. Endpoint Routing — The Modern Architecture
+---
 
-Modern ASP.NET Core (3.0+) uses a system called **Endpoint Routing**. It is critically important to understand that routing is split into **two separate steps**:
+## 2. Endpoint Routing — The Modern Two-Stage Architecture
 
-### Step 1: Route Matching (UseRouting)
-The routing middleware examines the URL and determines *which* endpoint matches. **It does NOT execute the endpoint yet.** It simply stores the matched endpoint in the `HttpContext` for later.
+Prior to ASP.NET Core 3.0, routing was an internal subsystem of MVC (`app.UseMvc()`). MVC performed route matching, authentication, authorization, and action execution all inside a single monolithic block. This made it impossible for other middleware to inspect endpoint metadata.
 
-### Step 2: Endpoint Execution (MapControllers / MapGet)
-After other middleware runs (like Authorization), the endpoint execution middleware actually *invokes* the matched C# method.
+Modern ASP.NET Core uses **Endpoint Routing**, which decouples routing into **two distinct pipeline stages**:
+
+```
+[ Incoming Request: GET /api/v1/documents/3fa85f64 ]
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 1. ROUTE MATCHING (app.UseRouting())                        │
+│    - Evaluates URL path against registered route tree       │
+│    - Finds matching Endpoint (e.g. GetDocumentByIdAction)   │
+│    - Attaches Endpoint Metadata to HttpContext              │
+│    - ⚠️ DOES NOT EXECUTE THE ENDPOINT YET!                  │
+└─────────────────────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ INTERMEDIATE MIDDLEWARE (Can Inspect Endpoint Metadata)     │
+│    - UseCors: Checks if endpoint has [EnableCors]           │
+│    - UseAuthentication: Establishes ClaimsPrincipal        │
+│    - UseRateLimiter: Checks endpoint rate limit policies    │
+│    - UseAuthorization: Checks [Authorize] & [RequireTenant] │
+└─────────────────────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. ENDPOINT EXECUTION (app.MapControllers() / MapEndpoints) │
+│    - Model binding parses route values & body payload       │
+│    - Action filters execute                                 │
+│    - Controller action / Minimal API lambda executes        │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ### Why Split Them?
 Because **middleware between routing and execution** can make decisions based on *which* endpoint was matched. This is revolutionary.
@@ -41,6 +73,8 @@ app.MapControllers();       // "Permission granted — execute GetSecretData"
 
 Without this split, the Authorization middleware wouldn't know *which* endpoint needs checking until it's already executed — which is too late.
 
+---
+
 ## 3. Controller Routing (Attribute Routing)
 
 For larger APIs, Controllers are the standard approach. You annotate your classes and methods with route attributes.
@@ -48,7 +82,7 @@ For larger APIs, Controllers are the standard approach. You annotate your classe
 ### Basic Controller Setup
 ```csharp
 [ApiController]                    // Enables API behaviors (auto 400, auto binding)
-[Route("api/[controller]")]       // Base route: /api/users (derived from class name)
+[Route("api/users")]              // Base route (explicit contract)
 public class UsersController : ControllerBase
 {
     private readonly IUserRepository _repository;
@@ -101,110 +135,98 @@ public class UsersController : ControllerBase
 ```
 
 ### The `[ApiController]` Attribute — What It Actually Does
-This single attribute enables **5 critical behaviors** that beginners often don't know about:
+This single attribute enables **critical behaviors** that streamline API development:
 
 | Behavior | What it does |
 |---|---|
 | **Automatic Model Validation** | If `ModelState` is invalid, automatically returns `400 Bad Request` before your code runs |
 | **Binding Source Inference** | Complex types default to `[FromBody]`, simple types default to `[FromRoute]` or `[FromQuery]` |
-| **Problem Details Responses** | Error responses use the standardized RFC 7807 format |
-| **Attribute Routing Required** | Forces you to use `[Route]` instead of convention-based routing |
-| **Multipart/form-data Inference** | File uploads with `IFormFile` are automatically inferred |
+| **Problem Details Responses** | Automatically formats error responses according to RFC 7807 Problem Details specification |
+| **Multipart/Form-Data Inference** | Parameters of type `IFormFile` or `IFormFileCollection` automatically bind from `[FromForm]` |
 
-### `[controller]` Token — Dynamic Route Segments
-The `[controller]` token in `[Route("api/[controller]")]` is automatically replaced with the controller's name (minus the "Controller" suffix).
-
+### ⚠️ The Renaming Trap: `[Route("api/[controller]")]`
+Many beginner templates use token replacement:
 ```csharp
-// Class: ProductsController → Route: /api/products
-// Class: OrdersController  → Route: /api/orders
-// Class: UsersController   → Route: /api/users
+[Route("api/[controller]")] // ❌ FRAGILE
+public class TenantsController : ControllerBase
+```
+If a developer refactors or renames `TenantsController` to `WorkspacesController`, the public API route silently changes from `/api/tenants` to `/api/workspaces`, breaking external clients!
+
+**Architectural Standard:** Always declare explicit, immutable URI paths:
+```csharp
+[Route("api/tenants")] // ✅ IMMUTABLE PRODUCTION CONTRACT
+public class TenantsController : ControllerBase
 ```
 
-## 4. Route Parameters and Constraints
+---
 
-### Route Parameters (Extracting Data from URLs)
-Use curly braces `{}` to define dynamic segments in routes:
+## 4. Route Parameters & Defensive Constraints
+
+Route constraints enforce data typing and structural invariants directly within the URL template. If the incoming URL fails the constraint, the routing engine does not match the endpoint, returning `404 Not Found` immediately.
 
 ```csharp
-// Single parameter
-[HttpGet("{id}")]                   // /api/users/42
-public IActionResult GetById(int id)
+[HttpGet("{id:int}")] // Matches only valid integers: /api/users/42
+public async Task<IActionResult> GetById(int id)
 
-// Multiple parameters
-[HttpGet("{year}/{month}")]         // /api/reports/2026/10
-public IActionResult GetReport(int year, int month)
+[HttpGet("{id:guid}")] // Matches only valid GUIDs: /api/documents/3fa85f64-...
+public async Task<IActionResult> GetById(Guid id)
 
-// Optional parameter
-[HttpGet("{id?}")]                  // /api/users OR /api/users/42
-public IActionResult Get(int? id)
+[HttpGet("slug/{slug:alpha:minlength(3)}")] // Alphabetical only, min length 3
+public async Task<IActionResult> GetBySlug(string slug)
 
-// Default value
-[HttpGet("{page=1}")]               // /api/users → page=1; /api/users/3 → page=3
-public IActionResult GetPaged(int page)
+// Optional parameters (?) and default values:
+[HttpGet("reports/{year:int?}")] // year is optional
+public async Task<IActionResult> GetReports(int? year)
+
+[HttpGet("search")] // query string parameters with defaults
+public async Task<IActionResult> Search([FromQuery] int page = 1, [FromQuery] int pageSize = 20)
 ```
 
-### Route Constraints (Type Safety in URLs)
-Without constraints, `/api/users/abc` would match `{id}` and then crash when trying to parse "abc" as an integer. Constraints prevent the match entirely:
+### Why Route Constraints are an Architect's Shield:
+1.  **Prevents Database Query Waste:** If a client requests `/api/tenants/invalid-text`, a `{id:guid}` constraint rejects the request at the routing level. The application never attempts to parse a string into a GUID or query the PostgreSQL database.
+2.  **Disambiguates Overloaded Routes:** You can map `GET /api/documents/{id:guid}` to a fetch-by-id action, and `GET /api/documents/{tag:alpha}` to a search-by-tag action without route collision errors.
+
+---
+
+## 5. Minimal APIs: Architecture, Route Groups & Performance
+
+Introduced in .NET 6 and expanded in .NET 8/9, **Minimal APIs** allow developers to define HTTP endpoints directly as lambda delegates, bypassing the entire MVC controller reflection pipeline.
+
+### Architectural Performance Characteristics:
+*   **Zero MVC Overhead:** Skips the Controller Activator, Action Descriptors, and filter pipeline allocation.
+*   **Native AOT Ready:** Can be pre-compiled into native machine code (Ahead-Of-Time compilation) with zero JIT overhead and instant cold starts.
+*   **Low Allocation:** Benchmark tests demonstrate up to 3x higher raw throughput and significantly reduced GC allocations compared to standard MVC controllers for simple operations.
+
+### Clean Organization with Route Groups
+Senior architects organize Minimal APIs using **Route Groups** (`MapGroup`) to apply shared security, prefixes, and tags across modular slices:
 
 ```csharp
-[HttpGet("{id:int}")]               // Only matches integers: /api/users/42
-[HttpGet("{slug:alpha}")]           // Only matches letters: /api/articles/hello-world
-[HttpGet("{id:guid}")]              // Only matches GUIDs: /api/orders/a1b2c3d4-...
-[HttpGet("{name:minlength(3)}")]    // Minimum 3 characters
-[HttpGet("{age:range(18,99)}")]     // Integer between 18 and 99
-[HttpGet("{email:regex(^.+@.+$)}")] // Matches a regex pattern
-```
-
-> **Best Practice:** Always use `{id:int}` instead of plain `{id}` for numeric parameters. Without the constraint, `/api/users/abc` returns a confusing 400 error. With it, you get a clean 404 — "this route doesn't exist" — which is correct.
-
-## 5. Minimal API Routing
-
-Minimal APIs define routes directly in `Program.cs` using extension methods on the `app` object. They're more concise and slightly faster (less overhead than Controller infrastructure).
-
-### Basic CRUD
-```csharp
-var app = builder.Build();
-
-app.MapGet("/api/products", async (IProductService service) =>
-    Results.Ok(await service.GetAllAsync()));
-
-app.MapGet("/api/products/{id:int}", async (int id, IProductService service) =>
-    await service.GetByIdAsync(id) is { } product
-        ? Results.Ok(product)
-        : Results.NotFound());
-
-app.MapPost("/api/products", async (CreateProductDto dto, IProductService service) =>
+public static class DocumentsEndpointExtensions
 {
-    var product = await service.CreateAsync(dto);
-    return Results.Created($"/api/products/{product.Id}", product);
-});
+    public static RouteGroupBuilder MapDocumentsEndpoints(this IEndpointRouteBuilder app)
+    {
+        var group = app.MapGroup("/api/v1/documents")
+            .WithTags("Documents")
+            .RequireAuthorization("RequireTenantAccess"); // Applies policy to all routes in group
 
-app.MapPut("/api/products/{id:int}", async (int id, UpdateProductDto dto, IProductService service) =>
-{
-    await service.UpdateAsync(id, dto);
-    return Results.NoContent();
-});
+        group.MapGet("/", async (IMediator mediator, CancellationToken ct) =>
+        {
+            var results = await mediator.Send(new GetDocumentsQuery(), ct);
+            return TypedResults.Ok(results);
+        });
 
-app.MapDelete("/api/products/{id:int}", async (int id, IProductService service) =>
-{
-    await service.DeleteAsync(id);
-    return Results.NoContent();
-});
+        group.MapPost("/", async (CreateDocumentDto dto, IMediator mediator, CancellationToken ct) =>
+        {
+            var created = await mediator.Send(new CreateDocumentCommand(dto), ct);
+            return TypedResults.Created($"/api/v1/documents/{created.Id}", created);
+        });
+
+        return group;
+    }
+}
 ```
 
-### Route Groups (Organizing Minimal APIs)
-When you have many Minimal API endpoints, `Program.cs` gets messy. Use **Route Groups** to organize:
-
-```csharp
-var products = app.MapGroup("/api/products");
-
-products.MapGet("/", GetAll);
-products.MapGet("/{id:int}", GetById);
-products.MapPost("/", Create);
-
-// You can apply middleware/filters to the entire group
-products.RequireAuthorization();
-```
+---
 
 ## 6. HTTP Return Types and Status Codes
 
@@ -213,26 +235,104 @@ Understanding what to return from your endpoints is crucial for building proper 
 ### Controller Return Types
 ```csharp
 return Ok(data);                    // 200 — Success with data
-return NoContent();                 // 204 — Success, no data to return
-return Created(uri, data);          // 201 — Resource created successfully
+return NoContent();                 // 204 — Success, no data to return (PUT/DELETE)
+return CreatedAtAction(nameof(GetById), new { id = data.Id }, data); // 201 — Resource created with Location header
 return BadRequest(errors);          // 400 — Client sent invalid data
-return Unauthorized();              // 401 — Not authenticated
-return Forbid();                    // 403 — Authenticated but not authorized
-return NotFound();                  // 404 — Resource doesn't exist
-return Conflict(message);           // 409 — Business rule violation
+return Unauthorized();              // 401 — Identity not authenticated
+return Forbid();                    // 403 — Authenticated but unauthorized
+return NotFound();                  // 404 — Resource does not exist
+return Conflict(message);           // 409 — Business rule or concurrency conflict
 ```
 
 ### Minimal API Return Types
 ```csharp
-return Results.Ok(data);
-return Results.NoContent();
-return Results.Created(uri, data);
-return Results.BadRequest(errors);
-return Results.NotFound();
-return Results.Problem(detail, statusCode: 500);
+return TypedResults.Ok(data);
+return TypedResults.NoContent();
+return TypedResults.Created($"/api/documents/{id}", data);
+return TypedResults.BadRequest(errors);
+return TypedResults.NotFound();
+return TypedResults.Problem(detail: "Database timeout", statusCode: 500);
 ```
 
-## 7. Real-World Routing from Your Projects
+---
+
+## 7. Real-Time Endpoints with SignalR: WebSockets at Enterprise Scale
+
+REST APIs follow a strict request-response paradigm: the client must initiate every interaction. For real-time applications — live document processing indicators, notifications, chat, and agent streaming — ASP.NET Core provides **SignalR**.
+
+SignalR abstracts transport protocols (WebSockets, Server-Sent Events, Long Polling) behind a strongly-typed **Hub** abstraction.
+
+### 🏗️ SignalR Routing in Normora:
+Normora maps multiple dedicated real-time hubs in `Program.cs`:
+
+```csharp
+// From Normora's Program.cs
+app.MapHub<DocumentHub>("/hubs/documents").AsBffApiEndpoint();
+app.MapHub<NotificationHub>("/hubs/notifications").AsBffApiEndpoint();
+```
+
+Notice the `.AsBffApiEndpoint()` modifier: this ensures that WebSocket upgrade requests validate the client's Duende BFF anti-forgery tokens and cookie sessions!
+
+### ⚠️ The Multi-Node Scaling Problem: Why SignalR Needs a Backplane
+
+In production, you run multiple container replicas of your API behind a load balancer:
+
+```
+[ User Alice ] ── (WebSocket Conn) ──▶ [ API Pod 1 ]
+                                              ⚡ (How does Pod 1 tell Pod 2?)
+[ User Bob ]   ── (WebSocket Conn) ──▶ [ API Pod 2 ]
+```
+
+If User Alice uploads a document on **Pod 1**, and a background worker completes its processing, Pod 1 attempts to broadcast `Clients.User(Bob).SendAsync("DocumentReady")`. But Bob is connected to **Pod 2**! Pod 1 has no idea Bob exists, and the real-time notification is silently dropped.
+
+### 🛡️ The Architectural Fix: Redis Backplane
+
+Normora scales SignalR horizontally across multi-replica clusters by configuring a **Redis Backplane**. When Pod 1 publishes a message, it writes to a Redis Pub/Sub channel. Every API pod subscribes to Redis, receives the broadcast, and dispatches it to any locally connected client.
+
+```csharp
+// From Normora.Infrastructure/Extensions/ApplicationServiceExtensions.cs
+public static IServiceCollection AddNormoraSignalR(
+    this IServiceCollection services, 
+    IOptions<RedisOptions> redisOptions)
+{
+    var signalRBuilder = services.AddSignalR(options =>
+    {
+        options.EnableDetailedErrors = false; // Security: Never leak internals in production
+    });
+
+    // If Redis connection is configured, wire the distributed Redis backplane
+    if (!string.IsNullOrWhiteSpace(redisOptions.Value.ConnectionString))
+    {
+        signalRBuilder.AddStackExchangeRedis(redisOptions.Value.ConnectionString, options =>
+        {
+            // Dedicated channel prefix to prevent collisions with other Redis databases
+            options.Configuration.ChannelPrefix = StackExchange.Redis.RedisChannel.Literal(redisOptions.Value.ChannelPrefix);
+        });
+    }
+
+    return services;
+}
+```
+
+---
+
+## 8. Modern AI Agent Endpoints: CopilotKit & AG-UI
+
+As enterprise software incorporates AI agents, backend architectures must host streaming protocols designed for multi-turn AI interactions and tool invocations.
+
+In **Normora**, the API integrates the **Microsoft Agent Framework** to power workplace intelligence agents via CopilotKit. Rather than writing custom WebSocket parsers, the endpoint is routed cleanly into the ASP.NET Core pipeline:
+
+```csharp
+// From Normora's Program.cs
+// Microsoft Agent Framework AG-UI endpoint for CopilotKit Workplace Intelligence:
+app.MapNormoraAguiServer()
+    .RequireAuthorization()
+    .AsBffApiEndpoint();
+```
+
+---
+
+## 9. Real-World Routing from Your Projects
 
 ### 🏗️ NextEvent: Lowercase URLs & Configurable CORS Origins
 ```csharp
@@ -256,20 +356,7 @@ services.AddCors(options =>
 });
 ```
 
-**Why `LowercaseUrls = true`?** REST API conventions dictate lowercase URLs. Without this, a controller named `UsersController` generates routes like `/api/Users` (uppercase U), which looks unprofessional and can cause caching issues.
-
-### 🏗️ Normora: SignalR Hub Routing + BFF Security
-Normora routes real-time WebSocket hubs alongside REST controllers, applying the same security:
-
-```csharp
-// From Normora's Program.cs
-app.MapControllers().AsBffApiEndpoint();                                    // REST APIs
-app.MapBffManagementEndpoints();                                           // /bff/login, /bff/logout
-app.MapHub<DocumentHub>("/hubs/documents").AsBffApiEndpoint();             // WebSocket
-app.MapHub<NotificationHub>("/hubs/notifications").AsBffApiEndpoint();     // WebSocket
-```
-
-**Key insight:** `.AsBffApiEndpoint()` enforces anti-forgery (CSRF) protection on every endpoint. This means a malicious website can't make requests to your API on behalf of a logged-in user, whether the endpoint is REST or WebSocket.
+**Why `LowercaseUrls = true`?** REST API conventions dictate lowercase URLs. Without this, a controller named `UsersController` generates routes like `/api/Users` (uppercase U), which looks unprofessional and causes caching anomalies across CDNs.
 
 ### 🏗️ NextEvent: JSON Serialization Configuration
 ```csharp
@@ -282,26 +369,44 @@ services.AddControllers()
     });
 ```
 
-*   **`CamelCase`:** C# properties (`FirstName`) are serialized as JSON (`firstName`). This follows JavaScript/API conventions.
-*   **`PropertyNameCaseInsensitive`:** When receiving JSON from clients, `firstname`, `FirstName`, and `FIRSTNAME` all bind correctly. This prevents frustrating 400 errors from case mismatches.
+*   **`CamelCase`:** C# properties (`FirstName`) are serialized as JSON (`firstName`), matching JavaScript frontend expectations.
+*   **`PropertyNameCaseInsensitive`:** When receiving JSON from clients, `firstname`, `FirstName`, and `FIRSTNAME` all bind correctly, preventing frustrating 400 errors from casing mismatches.
 
-## 8. Best Practices Summary
+### 🏗️ Modern API Documentation: Migrating from Swagger to Scalar
+In **Normora**, API documentation is generated using native .NET 9 OpenAPI and exposed through modern **Scalar UI**, gated strictly to Development:
+
+```csharp
+// From Normora's Program.cs
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+    app.MapScalarApiReference();
+    app.MapGet("/scalar", () => Results.Redirect("/scalar/v1")).ExcludeFromDescription();
+}
+```
+
+---
+
+## 10. Best Practices Summary
 
 | Practice | Why |
 |---|---|
-| **Use `LowercaseUrls = true`** | Professional REST API convention |
-| **Always use route constraints (`{id:int}`)** | Return clean 404s instead of confusing 400s |
+| **Use `LowercaseUrls = true`** | Professional REST API convention, prevents CDN cache fragmentation |
+| **Always use route constraints (`{id:guid}`)** | Shields database from garbage input, returns clean 404s |
 | **Use `[ApiController]` on every API controller** | Enables auto-validation, binding inference, Problem Details |
-| **Use `CamelCase` JSON** | JavaScript convention, frontend developers expect it |
-| **Group Minimal API endpoints with `MapGroup`** | Keeps `Program.cs` organized |
-| **Load CORS origins from configuration** | Same binary, different environments |
+| **Use `CamelCase` JSON** | Standard JavaScript convention for frontends |
+| **Group Minimal API endpoints with `MapGroup`** | Keeps `Program.cs` organized and applies shared security |
+| **Load CORS origins from configuration** | Same binary works across local dev, staging, and production |
 | **Use `CreatedAtAction` for POST endpoints** | Returns proper `201 Created` with a `Location` header |
+| **SignalR Redis Backplane** | Ensures multi-replica container pods route WebSockets to all users |
+| **Gate Documentation in Production** | Never expose OpenAPI / Swagger / Scalar UIs publicly in production |
 
 ---
 **Key Takeaways:**
 1. Routing maps URLs to C# methods. Endpoint Routing splits matching from execution so authorization can run in between.
 2. Controllers give you structure and features. Minimal APIs give you speed and simplicity.
-3. Route constraints (`{id:int}`) prevent type mismatches from reaching your code.
-4. Always configure `LowercaseUrls`, `CamelCase` JSON, and route constraints from day one.
+3. Route constraints (`{id:guid}`) prevent type mismatches from reaching your database.
+4. Scale real-time WebSockets across multi-node clusters using a Redis backplane.
+5. Always configure `LowercaseUrls`, `CamelCase` JSON, and route constraints from day one.
 
-**Next up:** Module 5 — **Configuration and the Options Pattern**. How do you manage database passwords, API keys, and environment-specific settings without hardcoding them?
+**Next up:** In [Module 5](05_Module_5_Configuration_and_Options.md), we dive into **Configuration and the Options Pattern** — how to manage database credentials, API keys, and environment settings without hardcoding secrets.
