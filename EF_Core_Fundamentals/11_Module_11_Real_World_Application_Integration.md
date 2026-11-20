@@ -1,52 +1,60 @@
 # Module 11: Real-World Application Integration & Production-Ready Database Management
 
-When taking Entity Framework Core from development to production, knowing how to write LINQ queries or generate migrations is only half the battle. In real-world enterprise architectures, you must know how to properly integrate `DbContext` into ASP.NET Core, structure architectural boundaries, diagnose performance, and establish a rock-solid, production-ready database deployment strategy.
+When taking Entity Framework Core 10 from local development to production, knowing how to write LINQ queries or generate migrations is only half the battle. In real-world enterprise architectures, you must know how to integrate `DbContext` cleanly into ASP.NET Core 10 and background workers, enforce strict module boundaries, intercept and observe database behavior, test against real relational engines, and establish a rock-solid, zero-downtime deployment strategy.
 
-A production-ready system requires a **controlled, versioned, reviewable, and repeatable database deployment process**. It does not necessarily require a separate DB Changes Repository, but it demands clear schema ownership, disciplined deployment mechanisms, and zero-downtime operational safety.
+A production-ready system requires a **controlled, versioned, reviewable, and repeatable database deployment process**. It does not necessarily require a separate DB Changes Repository, but it demands unambiguous schema ownership, disciplined lifecycle management, and operational safety.
 
 ---
 
-## 1. Integrating EF Core with ASP.NET Core
+## 1. Integrating EF Core 10 with ASP.NET Core (DI, Lifetimes & Resiliency)
 
-In modern ASP.NET Core applications (.NET 8/9), the `DbContext` is managed by the built-in Dependency Injection (DI) container. 
+In modern ASP.NET Core 10 applications, **Dependency Injection (DI)**—a pattern where the framework creates and supplies object dependencies rather than classes constructing them manually—manages the lifecycle of your `DbContext`.
+
+A **`DbContext`** represents a session with the database that combines two foundational patterns:
+* **Unit of Work:** Tracks all inserts, updates, and deletes in memory and commits them together in one atomic `SaveChangesAsync()` call.
+* **Change Tracker:** An internal snapshot dictionary inside `DbContext` that remembers the original property values of entities you loaded so EF Core knows which columns actually changed when generating SQL `UPDATE` statements.
 
 ```mermaid
 graph LR
-    subgraph "ASP.NET Core Runtime"
-        Req[HTTP Request] --> Scope[Create DI Scope]
-        Scope --> Ctx[Instantiate DbContext]
-        Ctx --> Handler[API Endpoint / Service]
-        Handler --> Save[SaveChangesAsync]
-        Save --> Dispose[Dispose DbContext & Close Connection]
+    subgraph "ASP.NET Core 10 Runtime"
+        Req["HTTP Request"] --> Scope["Create DI Scope"]
+        Scope --> Ctx["Instantiate Scoped DbContext"]
+        Ctx --> Handler["CQRS Handler / Service"]
+        Handler --> Save["SaveChangesAsync"]
+        Save --> Dispose["Dispose DbContext and Close Connection"]
     end
 ```
 
-### Registering DbContext in Program.cs
-You register your `DbContext` using the `AddDbContext<T>` extension method inside `Program.cs`. By default, this registers the context with a **Scoped** lifetime:
+### Registering DbContext in Program.cs and Module Extensions
+
+In a simple single-context app, you register `DbContext` in `Program.cs` using `AddDbContext<T>`. In a **.NET 10 Modular Monolith** like **Normora**, each business module encapsulates its own `DbContext` inside a module extension method (`{ModuleName}ModuleExtensions.cs` or `DatabaseServiceExtensions.cs`) backed by **PostgreSQL 15 + pgvector** via `UseNpgsql`.
 
 ```csharp
-var builder = WebApplication.CreateBuilder(args);
-
-// Read connection string from configuration
-var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
-    ?? throw new InvalidOperationException("Connection string 'DefaultConnection' not found.");
-
-// Register DbContext with SQL Server
-builder.Services.AddDbContext<NormoraDbContext>(options =>
+// Example: Registering a module DbContext in Normora (EF Core 10 + Npgsql + pgvector)
+builder.Services.AddDbContext<DocumentsDbContext>((serviceProvider, options) =>
 {
-    options.UseSqlServer(connectionString, sqlOptions =>
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+        ?? throw new InvalidOperationException(ApiMessages.DatabaseConnectionMissing);
+
+    options.UseNpgsql(connectionString, npgsqlOptions =>
     {
-        // Resilient database connections (handles transient network drops)
-        sqlOptions.EnableRetryOnFailure(
+        // Enable pgvector support for embedding similarity search
+        npgsqlOptions.UseVector();
+
+        // Isolate migration tracking per module schema
+        npgsqlOptions.MigrationsHistoryTable("__EFMigrationsHistory_Documents", "documents");
+
+        // Execution Strategy: automatically retry transient network/connection drops
+        npgsqlOptions.EnableRetryOnFailure(
             maxRetryCount: 5,
-            maxRetryDelay: TimeSpan.FromSeconds(30),
-            errorNumbersToAdd: null);
-            
-        // Explicit command timeout
-        sqlOptions.CommandTimeout(60);
+            maxRetryDelay: TimeSpan.FromSeconds(10),
+            errorCodesToAdd: null);
+
+        // Fail slow runaway queries after 30 seconds instead of exhausting worker threads
+        npgsqlOptions.CommandTimeout(30);
     });
-    
-    // Detailed logging during development
+
+    // Detailed diagnostics ONLY in local Development (never in Production!)
     if (builder.Environment.IsDevelopment())
     {
         options.EnableDetailedErrors();
@@ -55,96 +63,246 @@ builder.Services.AddDbContext<NormoraDbContext>(options =>
 });
 ```
 
-### Why DbContext MUST be Scoped
-`DbContext` is **not thread-safe**, holds state via the Change Tracker, and manages an underlying database connection. 
-*   **Why not Singleton?** If registered as a Singleton, every concurrent HTTP request would share the same instance. The Change Tracker would continuously accumulate tracked entities across requests, consuming gigabytes of memory, while concurrent queries would throw `InvalidOperationException: A second operation was started on this context instance before a previous operation completed`.
-*   **Why not Transient?** If registered as Transient, multiple services within the same HTTP request would receive different instances, resulting in multiple database connections and isolated change trackers that break Unit of Work consistency.
-*   **Scoped Lifetime is the Sweet Spot:** ASP.NET Core creates a new DI scope per HTTP request. The `DbContext` is instantiated once per request, shared across all services in that scope, and automatically disposed when the request ends.
+> [!NOTE]
+> **What is an Execution Strategy (`EnableRetryOnFailure`)?**
+> Cloud networks and containerized PostgreSQL instances occasionally experience brief TCP resets or transient failovers. `EnableRetryOnFailure` wraps EF Core commands in a retry policy that replays failed transient commands automatically.
+>
+> **When NOT to use `EnableRetryOnFailure` blindly:** If your code opens an explicit manual transaction (`await context.Database.BeginTransactionAsync()`), EF Core **throws an `InvalidOperationException`** when `EnableRetryOnFailure` is active because EF Core cannot safely replay half of a user-managed transaction. You must wrap manual transactions inside `await context.Database.CreateExecutionStrategy().ExecuteAsync(async () => { ... })` so the entire transaction block can be retried as a single unit.
+
+### Why DbContext MUST be Scoped (and When NOT to Use Scoped)
+
+`DbContext` is **not thread-safe**, holds mutable state in its Change Tracker, and leases an underlying database connection.
+*   **Why not Singleton?** If registered as a Singleton, every concurrent HTTP request shares one instance. The Change Tracker accumulates every entity ever loaded until memory runs out, while concurrent queries throw `InvalidOperationException: A second operation was started on this context instance before a previous operation completed`.
+*   **Why not Transient?** If registered as Transient, two services in the same HTTP request receive separate `DbContext` instances, opening multiple connections and splitting what should be one atomic Unit of Work into separate, inconsistent transactions.
+*   **Scoped Lifetime is the Default Sweet Spot:** ASP.NET Core creates a fresh **DI Scope** per HTTP request. One `DbContext` instance per module is created on first use, shared by all handlers/interceptors in that request, and automatically disposed when the request ends.
+
+**When NOT to rely on an HTTP Scoped `DbContext`:**
+1. **Background Workers (`Normora.Worker` / Hangfire / `BackgroundService`):** There is no HTTP request scope. You must explicitly create a new `IServiceScope` per job or use `IDbContextFactory<T>`.
+2. **Parallel Queries (`Task.WhenAll`):** Running two EF Core queries concurrently on the *same* scoped `DbContext` inside one request throws a concurrency exception. Run them sequentially with `await` or use separate contexts from `IDbContextFactory<T>`.
+3. **Long-Lived Connections (SignalR Hubs / LLM Token Streams):** Never keep a scoped `DbContext` and its database connection alive while streaming tokens over SignalR or waiting on slow external HTTP APIs.
+
+### Real-World Normora Examples (ASP.NET Core & DI Integration)
+
+1. **Per-Module Registration (`DocumentsModuleExtensions`):** `DocumentsDbContext` is registered with `UseNpgsql`, `UseVector()` (for 768/1536-dimension Gemini embedding columns), `MigrationsHistoryTable("__EFMigrationsHistory_Documents", "documents")`, and `EnableRetryOnFailure`, keeping SQL Server/vendor leaks out of domain handlers.
+2. **Dynamic Tenant Filter Binding vs. Unscoped Root:** `DocumentsDbContext` and `ConversationsDbContext` accept scoped `ITenantContext` in their constructors so global query filters evaluate `_tenantContext.TenantId` dynamically per request, whereas `TenantsDbContext` remains unscoped to handle tenant-slug bootstrapping and cross-workspace memberships.
+3. **Execution Strategy Around Atomic Document Uploads:** In `UploadDocumentCommandHandler`, because `EnableRetryOnFailure` is active, inserting the `Document`, `DocumentVersion`, and `DocumentProcessingOutboxMessage` inside an explicit transaction uses `await db.Database.CreateExecutionStrategy().ExecuteAsync(...)` so transient PostgreSQL blips retry the full unit safely.
+4. **Single Unit of Work in Conversational Turns:** When a chat turn completes in `Conversations`, the handler adds the user `Message`, assistant `Message`, and `MessageCitation` rows to the scoped `ConversationsDbContext` and commits them in one `SaveChangesAsync()` call—either all persist or none do.
+5. **Redis Cache Before `TenantsDbContext`:** On every incoming HTTP request, `TenantResolutionMiddleware` checks Redis (`30s–5m` sliding cache) for the tenant slug and user RBAC permissions first, hitting `TenantsDbContext` only on a cache miss so database connections aren't wasted on repetitive auth lookups.
 
 ---
 
-## 2. Advanced DbContext Lifecycles: Pooling & Factories
+## 2. Advanced DbContext Lifecycles: Pooling (`AddDbContextPool`) & Factories (`IDbContextFactory<T>`)
 
-For high-performance APIs or background workers, EF Core provides specialized lifecycle patterns.
-
-### DbContext Pooling (`AddDbContextPool`)
-Creating a new `DbContext` instance incurs memory allocations and overhead from initializing internal services. For high-throughput scenarios, EF Core provides **DbContext Pooling**:
-
-```csharp
-builder.Services.AddDbContextPool<NormoraDbContext>(options =>
-    options.UseSqlServer(connectionString));
-```
+For high-throughput endpoints, background workers, or concurrent workloads, EF Core provides two specialized lifecycle mechanisms beyond standard `AddDbContext<T>`.
 
 ```mermaid
 graph TD
-    Pool[(DbContext Pool)] -->|Checkout Available Instance| Req1[HTTP Request Scope]
-    Req1 -->|Reset State & Return to Pool| Pool
+    subgraph "AddDbContextPool (Stateless Only)"
+        Pool[("DbContext Pool (Max 1024)")] -->|"Checkout Clean Instance"| Req1["HTTP Request Scope"]
+        Req1 -->|"Reset Change Tracker & Return"| Pool
+    end
+
+    subgraph "IDbContextFactory (Workers & Parallelism)"
+        Factory["IDbContextFactory (Singleton or Scoped)"] -->|"CreateDbContextAsync"| Job1["Hangfire Job Batch 1"]
+        Factory -->|"CreateDbContextAsync"| Job2["Parallel Task 2"]
+        Job1 -->|"await using Dispose"| End1["Closed Immediately"]
+        Job2 -->|"await using Dispose"| End2["Closed Immediately"]
+    end
 ```
 
-*   **How it works:** When a request completes, EF Core resets the `DbContext` state (clearing the Change Tracker) and returns the instance to a pool rather than disposing it.
-*   **Limitations:** You cannot inject scoped dependencies (like tenant state or user identity) directly into the `DbContext` constructor when pooling is enabled, because the context instance outlives the request scope.
+### DbContext Pooling (`AddDbContextPool`)
+
+* **What it is:** Instead of instantiating and garbage-collecting a brand-new `DbContext` (and its internal service graph) on every request, EF Core maintains a pool of pre-allocated `DbContext` instances (default max size: `1024`).
+* **Why use it:** Reduces GC pressure and object allocation overhead under extremely high request-per-second (RPS) traffic.
+* **How it works:**
+  ```csharp
+  builder.Services.AddDbContextPool<SessionDbContext>(options =>
+      options.UseNpgsql(connectionString), poolSize: 128);
+  ```
+  When the HTTP scope finishes, EF Core calls an internal reset routine (wiping the Change Tracker and state) and returns the instance to the pool.
+* **When NOT to use `AddDbContextPool` (CRITICAL):**
+  * **Never use pooling if your `DbContext` injects scoped services like `ITenantContext` or `ICurrentUserService`!** Because a pooled `DbContext` instance outlives the HTTP request and is reused across requests, EF Core **forbids** scoped constructor dependencies (throwing an `InvalidOperationException` at startup or risking catastrophic cross-tenant data leakage if stored in static/cached fields).
+  * **Never store mutable instance fields** on a pooled `DbContext` that EF Core doesn't know how to reset.
 
 ### DbContext Factory (`IDbContextFactory<T>`)
-In scenarios where work runs outside of a standard HTTP request—such as Blazor Server components, Quartz/Hangfire background workers, or parallel task execution—injecting a Scoped `DbContext` is either impossible or dangerous. Use `IDbContextFactory<T>`:
 
-```csharp
-// Program.cs
-builder.Services.AddDbContextFactory<NormoraDbContext>(options =>
-    options.UseSqlServer(connectionString));
+* **What it is:** A factory (`IDbContextFactory<TContext>`) that creates short-lived, isolated `DbContext` instances on demand via `await using var context = await _factory.CreateDbContextAsync(ct)`.
+* **Why use it:** Ideal whenever code executes outside a normal HTTP request scope or needs parallel database work without thread-safety conflicts.
+* **How it works (C# Primary Constructor in `.NET 10`):**
+  ```csharp
+  // Registration
+  builder.Services.AddDbContextFactory<DocumentsDbContext>(options =>
+      options.UseNpgsql(connectionString, o => o.UseVector()));
 
-// Background Worker Service
-public class ReportGenerationWorker : BackgroundService
-{
-    private readonly IDbContextFactory<NormoraDbContext> _contextFactory;
+  // Background worker in Normora.Worker using primary constructor DI
+  public sealed class DocumentPurgeWorker(
+      IDbContextFactory<DocumentsDbContext> contextFactory,
+      ILogger<DocumentPurgeWorker> logger) : BackgroundService
+  {
+      protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+      {
+          while (!stoppingToken.IsCancellationRequested)
+          {
+              // Short-lived, isolated context for this single batch
+              await using var db = await contextFactory.CreateDbContextAsync(stoppingToken);
 
-    public ReportGenerationWorker(IDbContextFactory<NormoraDbContext> contextFactory)
-    {
-        _contextFactory = contextFactory;
-    }
+              var expiredDocs = await db.Documents
+                  .IgnoreQueryFilters() // Worker operates across tenants explicitly
+                  .Where(d => d.PurgeAfterUtc <= DateTime.UtcNow)
+                  .Take(50)
+                  .ToListAsync(stoppingToken);
 
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            // Create a short-lived, dedicated DbContext for this processing batch
-            await using var context = await _contextFactory.CreateDbContextAsync(stoppingToken);
-            
-            var pendingReports = await context.Reports
-                .Where(r => r.Status == ReportStatus.Pending)
-                .ToListAsync(stoppingToken);
-                
-            // Process and save...
-            await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
-        }
-    }
-}
-```
+              // Process and dispose immediately...
+              logger.LogInformation("Scanned {Count} expired documents.", expiredDocs.Count);
+              await Task.Delay(TimeSpan.FromMinutes(5), stoppingToken);
+          }
+      }
+  }
+  ```
+* **When NOT to use `IDbContextFactory<T>`:** Do not use it inside normal single-threaded CQRS HTTP handlers just to "avoid DI"—creating multiple contexts inside one HTTP request breaks single-transaction Unit of Work guarantees and wastes connections. Also note that `AddDbContextFactory<T>` registers the factory as a **Singleton** by default, so if your `DbContext` constructor depends on a scoped `ITenantContext`, you must either pass `ServiceLifetime.Scoped` to `AddDbContextFactory` or create a new `IServiceScope` per Hangfire job and resolve the scoped `DbContext` normally.
+
+### Real-World Normora Examples (Advanced Lifecycles)
+
+1. **Why `DocumentsDbContext` & `ConversationsDbContext` Reject Pooling:** Both contexts inject scoped `ITenantContext` to enforce dynamic global tenant query filters (`d.TenantId == _tenantContext.TenantId`). Using `AddDbContextPool` is forbidden here because tenant state must strictly die with each request scope.
+2. **Where Pooling Fits (`SessionDbContext`):** Normora's Duende BFF `SessionDbContext` (migrated via `SessionDatabaseMigrator`) manages encrypted server-side user sessions keyed by session ID without per-request tenant filter dependencies, making it a safe candidate for `AddDbContextPool`.
+3. **`HangfireDocumentProcessingOutboxDispatcher` in `Normora.Worker`:** Hangfire jobs execute in `Normora.Worker` with no `HttpContext`. Each job creates an explicit DI scope (or uses `IDbContextFactory<DocumentsDbContext>`), reads the outbox message's explicit `Guid TenantId`, and performs ingestion scoped strictly to that tenant.
+4. **Parallel Fan-Out Without Concurrency Crashes:** If a dashboard or maintenance job needs to aggregate independent metrics from `TenantsDbContext` and `DocumentsDbContext` simultaneously via `Task.WhenAll`, each module has its own distinct `DbContext` instance (or factory-created instance) rather than running two queries concurrently on a single `DbContext`.
+5. **Protecting Connections During Gemini SSE Streaming:** In `Conversations` (`NormoraWorkplaceAgent`), `ConversationTurnPreparer` loads history and retrieves chunks via `Documents`, then releases database resources **before** streaming tokens from Google Gemini over SSE (`text/event-stream`). Only after the stream finishes does it open/use a clean unit of work to persist the final assistant message.
 
 ---
 
-## 3. Direct DbContext vs. Repository Pattern
+## 3. Direct DbContext, CQRS Slices & Module Encapsulation vs. Repository Pattern
 
-A frequent architectural debate in .NET is whether to wrap EF Core in generic repositories.
+A frequent architectural debate in .NET is whether to wrap EF Core in generic repositories (`IRepository<T>`).
 
-| Aspect | Direct DbContext | Generic Repository (`IRepository<T>`) |
+| Aspect | Direct DbContext in CQRS Slices | Generic Repository (`IRepository<T>`) |
 | :--- | :--- | :--- |
 | **ORM Alignment** | Embraces EF Core as an existing Unit of Work (`DbContext`) and Repository (`DbSet<T>`). | Introduces an abstraction layer over an already existing abstraction. |
-| **LINQ Support** | Full access to projections (`Select`), eager loading (`Include`), and compiled queries. | Often crippled to `IEnumerable<T>` or forces leaky abstractions with `IQueryable<T>`. |
+| **LINQ Support** | Full access to projections (`Select`), `AsNoTracking()`, `ExecuteUpdateAsync`, and compiled queries. | Often crippled to `IEnumerable<T>` or forces leaky abstractions with `IQueryable<T>`. |
 | **Performance** | Clean projection into DTOs avoids loading entire entity trees into memory. | Frequently fetches entire entities, wasting memory and database bandwidth. |
-| **Maintenance** | Zero boilerplate wrapper code. | Substantial boilerplate across dozens of entity interfaces and classes. |
+| **Maintenance** | Zero boilerplate wrapper code; organized cleanly by vertical operation. | Substantial boilerplate across dozens of entity interfaces and classes. |
 
-### The Verdict
-*   **Avoid Generic Repositories:** Do not write `IRepository<T>` with generic `GetAll()`, `GetById()`, and `Add()` methods. `DbContext` already implements the Unit of Work pattern, and `DbSet<T>` already implements the Repository pattern.
+### The Verdict: CQRS Vertical Slices + 100% DbContext Encapsulation
+
+**CQRS (Command Query Responsibility Segregation)** separates operations that mutate state (**Commands**) from operations that read state (**Queries**). In Normora, each module organizes operations into dedicated folders (`Application/{Feature}/Commands/{OperationName}/` and `Queries/{OperationName}/`) using **MediatR** (an in-process mediator library that decouples callers from handlers).
+
+*   **Avoid Generic Repositories:** Do not write `IRepository<T>` with generic `GetAll()`, `GetById()`, and `Add()` methods. `DbContext` already implements Unit of Work, and `DbSet<T>` already implements Repository.
+*   **Enforce 100% DbContext Encapsulation Across Modules:** Direct `DbContext` usage is **strictly private to the owning module**. In Normora, `Conversations` handlers must **never** inject `DocumentsDbContext` or `TenantsDbContext`, and `Normora.Api` controllers must **never** inject any `DbContext`. Cross-module communication travels exclusively over MediatR contracts in `Normora.Shared.Contracts.*` carrying an explicit `Guid TenantId`.
 *   **When Abstractions Make Sense:**
-    1. **Specific Domain Repositories:** Create intentional repositories for complex domain aggregates (e.g., `IOrderRepository.GetOrderWithBillingSummaryAsync(id)`) to enforce domain invariant rules.
-    2. **Query Handlers (CQRS):** Use MediatR or Wolverine query handlers that query the `DbContext` directly using `AsNoTracking()` and projections, keeping writes strictly encapsulated in commands.
+    1. **Specific Domain Repositories:** Create intentional repositories only for complex domain aggregates with strict invariants that span multiple child collections.
+    2. **External Provider Ports:** Wrap third-party vendor SDKs (MinIO S3, Google Gemini, PayU) behind provider-neutral interfaces (`IDocumentStorageService`, `ITextEmbeddingService`) in the module, implemented in `Normora.Infrastructure`.
+*   **When NOT to Expose `IQueryable<T>`:** Never return an unevaluated `IQueryable<T>` from a service or cross-module contract. Doing so leaks EF Core persistence details, breaks encapsulation, and causes deferred execution surprises after the `DbContext` is disposed.
+
+```mermaid
+flowchart LR
+    subgraph "Conversations Module"
+        CTP["ConversationTurnPreparer"]
+    end
+    subgraph "Normora.Shared.Contracts.Documents"
+        Q["PerformHybridRetrievalQuery (TenantId, QueryText)"]
+    end
+    subgraph "Documents Module (Encapsulated)"
+        H["PerformHybridRetrievalQueryHandler"]
+        DDB[("DocumentsDbContext")]
+    end
+
+    CTP -->|"MediatR Send"| Q
+    Q --> H
+    H --> DDB
+    CTP -.->|"FORBIDDEN: Direct DbContext Injection"| DDB
+```
+
+### Real-World Normora Examples (CQRS & Module Encapsulation)
+
+1. **Direct `DocumentsDbContext` in CQRS Command Folder:** `UploadDocumentCommandHandler` (residing in `server/Modules/Documents/Application/Documents/Commands/UploadDocument/`) injects `DocumentsDbContext` directly via a C# primary constructor, avoiding redundant `IDocumentRepository` wrappers.
+2. **Read-Only Query Projection on Unscoped `TenantsDbContext`:** `GetAuditLogsQueryHandler` queries `TenantsDbContext` with `.AsNoTracking()`, explicitly filters `.Where(a => a.TenantId == request.TenantId)` (because `TenantsDbContext` has no global tenant filter), and projects directly to `AuditLogDto` with pagination.
+3. **Cross-Module Hybrid Search via MediatR:** When `ConversationTurnPreparer` or `SearchCompanyDocumentsTool` in `Conversations` needs document chunks, it dispatches `PerformHybridRetrievalQuery` in `Normora.Shared.Contracts.Documents` (passing `Guid TenantId`) instead of injecting `DocumentsDbContext` or `IRetrievalService`.
+4. **Cross-Module MCP Tool Execution:** `McpController` inside `Documents` discovers and runs conversational agent tools via `GetMcpToolsQuery` and `ExecuteMcpToolCommand` in `Normora.Shared.Contracts.Conversations`—zero direct reference to `ConversationsDbContext`.
+5. **EF Core 10 `GroupBy` Translation Rule in Metrics Handlers:** In `GetDocumentMetricsQueryHandler`, Normora projects `.GroupBy(d => d.Status).Select(g => new { Status = g.Key, Count = g.Count() })` to an anonymous type first, then maps to the C# `DocumentStatusMetricDto` record in memory—preventing EF Core's relational compiler from throwing an `InvalidOperationException` (HTTP 400) on parameterized record constructors inside `GroupBy`.
 
 ---
 
-## 4. Logging, Debugging, and Query Diagnostics
+## 4. Interceptors, Auditing & the Transactional Outbox Pattern
+
+Real-world applications rarely just read and write rows—they also stamp audit metadata, track slow SQL queries, and trigger reliable background work (like document chunking and embedding generation) without breaking transaction boundaries.
+
+### EF Core Interceptors (`SaveChangesInterceptor` & `DbCommandInterceptor`)
+
+* **What they are:** Hook classes registered with EF Core that automatically run before or after key lifecycle events—such as `SaveChangesAsync()` (`ISaveChangesInterceptor`) or SQL command execution (`IDbCommandInterceptor`).
+* **Why use them:** Centralizes cross-cutting persistence concerns (like setting `CreatedAtUtc` / `UpdatedAtUtc`, enforcing soft deletes, or measuring command durations) without repeating boilerplate in every CQRS handler.
+* **How it works:**
+  ```csharp
+  public sealed class AuditTimestampsInterceptor(TimeProvider timeProvider) : SaveChangesInterceptor
+  {
+      public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+          DbContextEventData eventData,
+          InterceptionResult<int> result,
+          CancellationToken cancellationToken = default)
+      {
+          if (eventData.Context is null)
+              return base.SavingChangesAsync(eventData, result, cancellationToken);
+
+          var now = timeProvider.GetUtcNow().UtcDateTime;
+          foreach (var entry in eventData.Context.ChangeTracker.Entries<IAuditableEntity>())
+          {
+              if (entry.State == EntityState.Added)
+                  entry.Entity.CreatedAtUtc = now;
+
+              if (entry.State is EntityState.Added or EntityState.Modified)
+                  entry.Entity.UpdatedAtUtc = now;
+          }
+
+          return base.SavingChangesAsync(eventData, result, cancellationToken);
+      }
+  }
+  ```
+* **When NOT to use Interceptors:** Never call external network APIs (MinIO S3 uploads, Google Gemini requests, Resend emails, or SignalR broadcasts) inside `SavingChangesAsync`. If the DB commit fails or rolls back after the external call, your system is left in an inconsistent state—and holding a database transaction open during slow network calls exhausts PostgreSQL connection pools.
+
+### The Transactional Outbox Pattern
+
+* **What it is:** A reliability pattern where instead of committing to PostgreSQL and then immediately calling an external queue/worker (which can fail mid-flight—known as the **dual-write problem**), you insert an **Outbox Message row** into a database table *inside the exact same database transaction* as your business entity.
+* **Why use it:** Guarantees **atomic consistency** ("all or nothing"). If the database commit succeeds, the outbox row is durably stored and guaranteed to be picked up by a background dispatcher even if Redis, Hangfire, or the process crashes a millisecond later.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant API as "UploadDocumentCommandHandler"
+    participant S3 as "MinIO (IDocumentStorageService)"
+    participant DB as "DocumentsDbContext (PostgreSQL)"
+    participant Wake as "IDocumentProcessingWakeup"
+    participant HF as "HangfireOutboxDispatcher (Normora.Worker)"
+
+    API->>S3: Upload raw file bytes
+    S3-->>API: ObjectKey confirmed
+    API->>DB: BeginTransaction (via ExecutionStrategy)
+    API->>DB: Insert Document + DocumentVersion
+    API->>DB: Insert DocumentProcessingOutboxMessage
+    API->>DB: Commit Transaction
+    API-->>Wake: Signal immediate wakeup (fire-and-forget)
+    Note over Wake,HF: Even if wakeup fails, 1-min recurring job recovers row
+    HF->>DB: Claim pending Outbox row
+    HF->>HF: Extract text, chunk, call Gemini batchEmbedContents
+    HF->>DB: Save DocumentChunks and mark Outbox Completed
+```
+
+* **When NOT to use an Outbox:** Skip the outbox for simple CRUD operations with no asynchronous downstream side effects (e.g., updating a department name or branding color) or for ephemeral UI state where eventual background retry isn't needed.
+
+### Real-World Normora Examples (Interceptors & Transactional Outbox)
+
+1. **`AuditTimestampsInterceptor` Across Modules:** Registers as a singleton/scoped interceptor on `TenantsDbContext`, `DocumentsDbContext`, and `ConversationsDbContext` so `CreatedAtUtc` and `UpdatedAtUtc` are stamped consistently using .NET `TimeProvider` without polluting CQRS handlers.
+2. **Atomic Document Upload + Outbox (`UploadDocumentCommandHandler`):** Inserts `Document`, `DocumentVersion`, and `DocumentProcessingOutboxMessage` inside a single `DocumentsDbContext` transaction, then triggers `IDocumentProcessingWakeup` asynchronously so downstream queue hiccups never fail an already-committed upload.
+3. **Self-Healing Outbox Dispatch (`HangfireDocumentProcessingOutboxDispatcher`):** Runs in `Normora.Worker`, claims pending `DocumentProcessingOutboxMessage` rows, and is backed by a minutely recurring Hangfire recovery job so zero uploads are stranded after container restarts.
+4. **Slow-Query `DbCommandInterceptor`:** Inspects executed SQL durations across `DocumentsDbContext` (such as pgvector cosine-distance queries) and emits structured warnings when execution exceeds thresholds—without logging raw query parameters.
+5. **Two-Phase HITL Document Deletion:** When an AI agent invokes `documents_delete`, `DeleteDocumentCommandHandler` writes a `PendingApproval` record in PostgreSQL with a 15-minute TTL rather than deleting MinIO blobs immediately; only after explicit user consent via `ApprovalsController` does `Normora.Worker` purge MinIO objects and chunks asynchronously.
+
+---
+
+## 5. Logging, Query Diagnostics, OpenTelemetry & Security Hardening
+
+In production systems, you cannot attach a debugger to inspect slow queries. You need structured diagnostics that expose SQL behavior without leaking tenant secrets.
 
 ### Capturing Generated SQL
-EF Core integrates seamlessly with `Microsoft.Extensions.Logging`. In development, SQL queries automatically stream to the console when logging is enabled in `appsettings.Development.json`:
+EF Core integrates seamlessly with `Microsoft.Extensions.Logging`. In development, SQL queries stream to the console when enabled in `appsettings.Development.json`:
 
 ```json
 {
@@ -157,37 +315,53 @@ EF Core integrates seamlessly with `Microsoft.Extensions.Logging`. In developmen
 }
 ```
 
-### Console Debugging (`LogTo`)
-For quick diagnostics or console apps, use `LogTo`:
+### Console Debugging (`LogTo`) & Sensitive Data Rules
+For quick diagnostics or console tools, use `LogTo`:
 
 ```csharp
 optionsBuilder
-    .UseSqlServer(connectionString)
+    .UseNpgsql(connectionString, o => o.UseVector())
     .LogTo(Console.WriteLine, LogLevel.Information)
-    .EnableSensitiveDataLogging(); // WARNING: Never enable in Production!
+    .EnableSensitiveDataLogging(); // WARNING: Strictly Development ONLY!
 ```
 
 > [!WARNING]
-> `EnableSensitiveDataLogging()` logs parameter values (like passwords, credit card numbers, and PII). Enabling this in production exposes sensitive data in log aggregators (e.g., Datadog, Seq, CloudWatch) and violates compliance standards (GDPR, HIPAA, PCI-DSS).
+> `EnableSensitiveDataLogging()` prints actual SQL parameter values—including `ExternalUserId` subjects, email addresses, document chunk text, and tenant secrets. Enabling it in production leaks PII to centralized log aggregators (Seq, Datadog, CloudWatch) and violates compliance standards (GDPR, HIPAA, SOC 2).
 
-### Query Tags (`TagWith`)
-In production environments running thousands of queries, pinpointing which C# code generated a slow SQL query in SQL Server Profiler or Azure SQL Insights can be frustrating. Use **Query Tags**:
+### Query Tags (`TagWith` & `TagWithCallSite`)
+In production environments running thousands of queries per minute, pinpointing which C# CQRS handler produced a slow PostgreSQL query in `pg_stat_statements` is hard without **Query Tags**:
 
 ```csharp
-var activeTenants = await context.Tenants
-    .TagWith("TenantDirectory: LoadActiveTenantsForLookup")
+var activeTenants = await tenantsDb.Tenants
+    .AsNoTracking()
+    .TagWith("Tenants: LoadActiveTenantsForLookup")
     .Where(t => t.IsActive)
-    .ToListAsync();
+    .Select(t => new TenantSummaryDto(t.Id, t.Slug, t.Name))
+    .ToListAsync(cancellationToken);
 ```
 
-EF Core injects the tag as a SQL comment at the very top of the query:
+EF Core injects the tag as a SQL comment directly above the PostgreSQL query:
 ```sql
--- TenantDirectory: LoadActiveTenantsForLookup
+-- Tenants: LoadActiveTenantsForLookup
 
-SELECT [t].[Id], [t].[Domain], [t].[IsActive], [t].[Name]
-FROM [Tenants] AS [t]
-WHERE [t].[IsActive] = CAST(1 AS bit)
+SELECT t."Id", t."Slug", t."Name"
+FROM tenants."Tenants" AS t
+WHERE t."IsActive" = TRUE
 ```
+You can also chain `.TagWithCallSite()` during debugging to include the exact C# file path and line number in the SQL comment.
+
+### OpenTelemetry & Security Hardening (CWE-209, BOLA & BFLA)
+* **OpenTelemetry (`AddEntityFrameworkCoreInstrumentation`):** Traces every EF Core command inside distributed HTTP/worker spans, showing exact timing from `Normora.Api` endpoint -> MediatR handler -> `DocumentsDbContext` -> PostgreSQL without recording sensitive parameter literals by default.
+* **CWE-209 (Information Exposure Through Error Messages):** Never surface `NpgsqlException.Message`, `DbUpdateException.InnerException`, or table/column names to HTTP responses, SignalR streams, or failure emails. Log full technical details internally and return standardized constants from `Normora.Shared.Constants.ApiMessages`.
+* **BOLA (Broken Object Level Authorization -> 404) & BFLA (Broken Function Level Authorization -> 403):** When a tenant-filtered EF Core query returns `null`, never distinguish "does not exist" from "belongs to another tenant." Throw `BolaException()` (mapped globally to `404 Not Found` with `ApiMessages.NotFound`) to prevent resource ID enumeration. Throw `BflaException()` (`403 Forbidden` with `ApiMessages.Forbidden`) when the user lacks role permission for the operation.
+
+### Real-World Normora Examples (Diagnostics & Hardening)
+
+1. **Tagging Hybrid RAG Queries (`PerformHybridRetrievalQueryHandler`):** Applies `.TagWith("Documents: HybridRetrievalRRF")` to pgvector cosine-similarity and full-text keyword queries so DBAs can correlate slow vector scans in `pg_stat_statements` straight back to the RAG handler.
+2. **OpenTelemetry End-to-End Trace Correlation:** `Normora.Infrastructure` configures OpenTelemetry to trace an entire `POST /api/conversations/{id}/messages` turn—linking Duende BFF auth, Redis tenant cache lookup, `PerformHybridRetrievalQuery` SQL spans, and Gemini API latency in one waterfall.
+3. **Environment-Gated `EnableSensitiveDataLogging()`:** `DatabaseServiceExtensions` wraps `EnableDetailedErrors()` and `EnableSensitiveDataLogging()` in `if (environment.IsDevelopment())`, guaranteeing production containers never log document embeddings, user prompts, or invite tokens.
+4. **CWE-209 Safe Failure Handling in `DocumentProcessingJob`:** If `SaveChangesAsync()` fails on a constraint or transient error in `Normora.Worker`, full stack traces go strictly to structured OpenTelemetry/Serilog logs, while admin notifications and SignalR failure events receive only `ApiMessages.DocumentProcessingFailed`.
+5. **Tenant-Scoped Null Lookup Mapping to `BolaException` (404):** In `GetDocumentByIdQueryHandler`, `DocumentsDbContext` automatically applies `_tenantContext.TenantId` via global query filter; if `FirstOrDefaultAsync(...)` returns `null` (whether deleted, nonexistent, or owned by another tenant), it throws `BolaException()` rather than leaking cross-tenant existence.
 
 ---
 

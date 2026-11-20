@@ -1,8 +1,15 @@
 # Module 5: Modeling Relationships and Navigation Properties
 
-In a relational database, tables rarely exist in isolation. They relate to one another. Entity Framework Core provides an incredibly powerful, albeit sometimes confusing, system for managing these relationships. 
+In a relational database (such as PostgreSQL in Normora), tables rarely exist in isolation—they link together to represent business rules. Entity Framework Core (EF Core 10) provides a rich, explicit system for mapping C# object relationships to relational foreign keys.
 
-To master relationships in EF Core, you must understand how **Navigation Properties**, the **Fluent API**, and **JSON Serialization** work together.
+Before we dive in, let's define five core terms you will see throughout this module:
+- **Principal Entity (Parent):** The independent entity whose primary (or alternate) key is referenced by another table (e.g., `Tenant` or `Document`).
+- **Dependent Entity (Child):** The entity that holds the foreign key pointing back to the principal (e.g., `TenantMembership` or `DocumentVersion`).
+- **Foreign Key (FK):** A column (like `TenantId` or `DocumentId`) on the dependent table that stores the key of its principal row so the database can enforce referential integrity.
+- **Navigation Property:** A property on a C# entity class (like `document.Versions` or `version.Document`) that lets you traverse a relationship in C# without writing manual SQL joins.
+- **Object Graph:** A connected web of C# entity instances linked in memory through their navigation properties.
+
+To master relationships in EF Core, you must understand how **Navigation Properties**, the **Fluent API** (placed in Normora's parameterless `IEntityTypeConfiguration<T>` classes, as covered in Module 4), and **JSON Serialization** work together.
 
 ---
 
@@ -10,42 +17,60 @@ To master relationships in EF Core, you must understand how **Navigation Propert
 
 The most important mental model to hold when building relationships is that EF Core operates across three distinct layers. When you run into an issue, you must identify *which layer* is causing the problem.
 
-```text
-              C# OBJECT MODEL (Layer 1)
-                     │
-              Navigation Props (.User, .Tenants)
-                     │
-                     ▼
-                EF CORE MODEL (Layer 2)
-                     │
-                Fluent API (.HasOne, .WithMany)
-                     │
-                     ▼
-              DATABASE RELATIONSHIP (Layer 2.5)
-                     │
-               Foreign Keys (TenantId)
-                     │
-                     ▼
-           API SERIALIZATION (Layer 3)
-                     │
-         [JsonIgnore] / DTO Mapping
-                     │
-                     ▼
-               JSON RESPONSE
+```mermaid
+flowchart TD
+    L1["Layer 1: C# Object Model - Navigation Props (.Memberships, .Department)"]
+    L2["Layer 2: EF Core Model - IEntityTypeConfiguration (.HasOne, .WithMany)"]
+    L25["Layer 2.5: PostgreSQL Schema - Foreign Key Constraints (TenantId, DocumentId)"]
+    L3["Layer 3: API Serialization - DTO Projection or JsonIgnore"]
+    JSON["HTTP JSON Response to Angular SPA"]
+
+    L1 --> L2
+    L2 --> L25
+    L25 --> L3
+    L3 --> JSON
 ```
 
 ### Layer 1: C# Object Model (Navigation Properties)
 Navigation properties represent how you navigate your objects in C#. They exist purely to express the relationship in the C# object graph.
-*   **Example:** `tenant.Users` or `user.Department`
+*   **Example:** `tenant.Memberships` or `membership.Tenant`
 
 ### Layer 2: EF Core Mapping (Fluent API)
-The Fluent API tells EF Core *how* those C# object navigation properties map to the relational database.
-*   **Example:** `.HasOne().WithMany().HasForeignKey()`
+The Fluent API tells EF Core *how* those C# object navigation properties map to the relational database. In Normora, these mappings live in dedicated, parameterless `IEntityTypeConfiguration<T>` classes inside `Persistence/Configurations/`.
+*   **Example:** `builder.HasOne(m => m.Tenant).WithMany(t => t.Memberships).HasForeignKey(m => m.TenantId)`
 
-### Layer 3: API / JSON Representation (`[JsonIgnore]`)
-Attributes like `[JsonIgnore]` control what gets exposed during JSON serialization when returning data from your API. They have **absolutely nothing** to do with how the database is configured.
+### Layer 3: API / JSON Representation (`[JsonIgnore]` & DTOs)
+Attributes like `[JsonIgnore]` (and preferably DTO projections) control what gets exposed during JSON serialization when returning data from your API. They have **absolutely nothing** to do with how the database is configured.
 
 > **Golden Rule:** Navigation properties describe how you want to navigate between entities in C#. The Fluent API tells EF Core how that relationship actually maps to the database tables and foreign keys.
+
+### Five Real-World Normora Examples Across the Three Layers
+
+1. **Tenant & Department (`TenantsDbContext`):**
+   - *Layer 1 (C#):* `Department.Tenant` (reference) and `Tenant.Departments` (collection).
+   - *Layer 2 (Fluent API):* `DepartmentConfiguration` maps `.HasOne(d => d.Tenant).WithMany(t => t.Departments).HasForeignKey(d => d.TenantId)`.
+   - *Layer 2.5 (PostgreSQL):* `tenants."Departments"."TenantId"` references `tenants."Tenants"."Id"`.
+   - *Layer 3 (API):* `DepartmentsController` returns `DepartmentDto` records (never raw `Department` entities), avoiding JSON cycles.
+2. **Document & DocumentVersion (`DocumentsDbContext`):**
+   - *Layer 1 (C#):* `Document.Versions` and `DocumentVersion.Document`.
+   - *Layer 2 (Fluent API):* `DocumentVersionConfiguration` sets `.HasForeignKey(v => v.DocumentId).OnDelete(DeleteBehavior.Cascade)`.
+   - *Layer 2.5 (PostgreSQL):* `documents."DocumentVersions"."DocumentId"` enforces valid parent documents.
+   - *Layer 3 (API):* `DocumentDto` projects only version numbers and statuses, hiding internal MinIO storage keys.
+3. **Conversation & Message (`ConversationsDbContext`):**
+   - *Layer 1 (C#):* `Conversation.Messages` and `Message.Conversation`.
+   - *Layer 2 (Fluent API):* `MessageConfiguration` maps `.HasForeignKey(m => m.ConversationId)`.
+   - *Layer 2.5 (PostgreSQL):* `conversations."Messages"."ConversationId"` links chat turns to a thread.
+   - *Layer 3 (API):* SignalR/SSE streaming and `ConversationsController` project `MessageDto` payloads for the Angular Copilot UI.
+4. **Tenant & TenantBranding (`TenantsDbContext`):**
+   - *Layer 1 (C#):* `Tenant.Branding` and `TenantBranding.Tenant`.
+   - *Layer 2 (Fluent API):* `TenantBrandingConfiguration` maps `.HasOne(b => b.Tenant).WithOne(t => t.Branding).HasForeignKey<TenantBranding>(b => b.TenantId)`.
+   - *Layer 2.5 (PostgreSQL):* Unique FK constraint on `TenantId` guarantees one branding row per workspace.
+   - *Layer 3 (API):* White-label endpoints return `BrandingDto` (colors, logo URL) without serializing the `Tenant` back-reference.
+5. **TenantMembership & Department (`TenantsDbContext`):**
+   - *Layer 1 (C#):* `MembershipDepartment` joins `TenantMembership` and `Department`.
+   - *Layer 2 (Fluent API):* `MembershipDepartmentConfiguration` sets a composite key `new { md.TenantMembershipId, md.DepartmentId }` and two `.HasOne().WithMany()` links.
+   - *Layer 2.5 (PostgreSQL):* Join table in `tenants` schema with two FK constraints.
+   - *Layer 3 (API):* Employee queries project `DepartmentSummaryDto` lists rather than exposing join rows directly.
 
 ---
 
@@ -98,30 +123,45 @@ public class TenantInvitation
 }
 ```
 
-*   **How to configure (Fluent API):** You explicitly define the relationship but leave the `WithMany()` method empty, exactly as seen in Normora's `TenantsDbContext`:
+*   **How to configure (Fluent API):** You explicitly define the relationship in a dedicated `IEntityTypeConfiguration<TenantInvitation>` class and leave the `WithMany()` method empty:
     
     ```csharp
-    modelBuilder.Entity<TenantInvitation>()
-        .HasOne(i => i.Tenant)
-        .WithMany() // <-- Left empty!
-        .HasForeignKey(i => i.TenantId)
-        .OnDelete(DeleteBehavior.Cascade);
+    public sealed class TenantInvitationConfiguration : IEntityTypeConfiguration<TenantInvitation>
+    {
+        public void Configure(EntityTypeBuilder<TenantInvitation> builder)
+        {
+            builder.HasOne(i => i.Tenant)
+                   .WithMany() // <-- Left empty: Tenant has no Invitations collection
+                   .HasForeignKey(i => i.TenantId)
+                   .OnDelete(DeleteBehavior.Cascade);
+        }
+    }
     ```
 
 *   **What exactly happens when `.WithMany()` is left empty?**
     1. **"The Parent has Many Children, but I don't want to track them."** You are telling EF Core: "A Tenant can have many Invitations, but my C# `Tenant` class does NOT have an `ICollection<TenantInvitation>` property."
-    2. **Database Level:** **Nothing changes.** EF Core still correctly creates a One-to-Many relationship in the SQL database, including the `TenantId` Foreign Key column on the `TenantInvitations` table.
+    2. **Database Level:** **Nothing changes.** EF Core still correctly creates a One-to-Many relationship in the PostgreSQL database, including the `TenantId` Foreign Key column on the `TenantInvitations` table.
     3. **C# Code Level:** Because the `Tenant` class has no collection property, you **cannot navigate** from the Parent to the Child in memory (e.g., `tenant.Invitations` doesn't exist). You can only navigate from Child to Parent (`invitation.Tenant`).
 
 *   **Why is this a Best Practice?** Use this to prevent massive, accidental data loading ("Object Graph Pollution"). If a `Tenant` has 100,000 invitations over its lifetime, and you provided a navigation property, a developer might accidentally loop through `tenant.Invitations`, instantly loading all 100,000 rows into RAM and crashing the API.
+*   **When NOT to use Bidirectional Collections:** Never put a collection navigation property on a parent when the child table grows without bound (audit logs, outbox messages, telemetry events, historical invitations).
 *   **How to query instead:** Always use Unidirectional relationships when the "Many" side contains a massive amount of data (e.g., Audit Logs, Invitations). Query those entities directly using the `DbContext` with pagination:
     ```csharp
     // Developers MUST do this instead:
     var invites = await dbContext.TenantInvitations
         .Where(i => i.TenantId == tenantId)
+        .OrderByDescending(i => i.CreatedAt)
         .Take(50) // Safe pagination!
         .ToListAsync();
     ```
+
+### Five Real-World Normora Examples (Bidirectional vs. Unidirectional)
+
+1. **`Document` <-> `DocumentVersion` (Bidirectional):** A document typically has a small, bounded set of uploaded revisions (v1, v2, v3). Both `document.Versions` and `version.Document` are useful when inspecting upload history or checking the active version.
+2. **`Tenant` <- `TenantInvitation` (Unidirectional Child -> Parent):** `TenantInvitation` holds `Tenant` + `TenantId`, while `Tenant` omits `Invitations`. Workspace invite queries paginate `dbContext.TenantInvitations` directly.
+3. **`Tenant` <- `AuditLog` (Unidirectional Child -> Parent):** `AuditLog` entries accumulate indefinitely across a workspace's lifetime. Keeping `AuditLogs` off `Tenant` prevents accidentally loading millions of audit rows when loading a workspace.
+4. **`Document` <- `DocumentProcessingOutboxMessage` (Unidirectional / Direct Query):** Hangfire's `HangfireDocumentProcessingOutboxDispatcher` queries pending outbox rows directly (`Where(m => m.ProcessedAt == null)`) rather than traversing through `Document.OutboxMessages`.
+5. **`Conversation` <-> `Message` vs. `Conversation` <- `PendingApproval`:** A `Conversation` holds `Messages` (bidirectional for rendering a chat thread), whereas `PendingApproval` (15-minute TTL HITL confirmation cards) is queried directly by `ApprovalId` and `TenantId` in `ApprovalsController` without polluting `Conversation` with expired approval history.
 
 ---
 
@@ -158,15 +198,40 @@ public class User
 Because there are many users. Each user needs to answer: *"Which tenant do I belong to?"* Therefore, `User.TenantId` is the foreign key. You don't put `Tenant.UserId` because a Tenant has multiple users.
 
 ### The Fluent API Mapping
-Even though EF Core can often guess the relationship via conventions, using the Fluent API gives you explicit control over delete behaviors and exact column mappings:
+Even though EF Core can often guess the relationship via conventions, using the Fluent API in an `IEntityTypeConfiguration<T>` class gives you explicit control over delete behaviors, nullability, and exact column mappings:
 
 ```csharp
-modelBuilder.Entity<User>()
-    .HasOne(u => u.Tenant)             // User has ONE Tenant
-    .WithMany(t => t.Users)            // Tenant has MANY Users
-    .HasForeignKey(u => u.TenantId)    // User.TenantId is the Foreign Key
-    .OnDelete(DeleteBehavior.Restrict); // Prevent deleting a Tenant if Users exist
+public sealed class UserConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        builder.HasOne(u => u.Tenant)             // User has ONE Tenant
+               .WithMany(t => t.Users)            // Tenant has MANY Users
+               .HasForeignKey(u => u.TenantId)    // User.TenantId is the Foreign Key
+               .IsRequired()                      // Required FK (NOT NULL in PostgreSQL)
+               .OnDelete(DeleteBehavior.Restrict); // Prevent deleting a Tenant if Users exist
+    }
+}
 ```
+
+### Required vs. Optional Relationships (`Guid` vs `Guid?`)
+Whether a foreign key is nullable or non-nullable changes both the database schema and how EF Core generates SQL joins:
+- **Required (`Guid TenantId` + `.IsRequired()`):** The FK column is `NOT NULL` in PostgreSQL. Every child *must* have a parent. EF Core uses `INNER JOIN` when including the principal, and defaults to `DeleteBehavior.Cascade`.
+- **Optional (`Guid? DepartmentId` + `.IsRequired(false)`):** The FK column allows `NULL`. A child can exist without a parent (for example, an unassigned company-wide `Document`). EF Core uses `LEFT JOIN` when querying, and defaults to `DeleteBehavior.ClientSetNull`.
+
+### Explicit Foreign Key Properties vs. Shadow Foreign Keys
+What if you include `public Tenant Tenant { get; set; }` on a child entity, **without** declaring `public Guid TenantId { get; set; }`?
+EF Core creates a **Shadow Foreign Key**—a hidden `TenantId` column in PostgreSQL managed only by EF Core's Change Tracker, with no C# property on the entity class.
+- **When Shadow FKs are used:** Pure Domain-Driven Design (DDD) models that want to hide persistence IDs from domain objects.
+- **When NOT to use Shadow FKs (Normora Standard):** Always declare **explicit FK properties** (`public Guid TenantId { get; set; }`). Without an explicit property, you cannot write clean `.Where(d => d.TenantId == tenantId)` global query filters, project `TenantId` in CQRS DTOs, or run BOLA ownership checks without loading the entire navigation object or calling `EF.Property<Guid>(entity, "TenantId")`.
+
+### Five Real-World Normora Examples (One-to-Many)
+
+1. **`Tenant` -> `TenantMembership` (`TenantsDbContext`):** Required 1:N (`Guid TenantId`). One workspace has many employee memberships; each membership belongs to one workspace.
+2. **`Document` -> `DocumentVersion` (`DocumentsDbContext`):** Required 1:N (`Guid DocumentId`). A logical document tracks multiple uploaded file revisions.
+3. **`DocumentVersion` -> `DocumentChunk` (`DocumentsDbContext`):** Required 1:N (`Guid DocumentVersionId`). Each processed document version splits into dozens of Markdown-aware chunks with pgvector embeddings.
+4. **`Conversation` -> `Message` (`ConversationsDbContext`):** Required 1:N (`Guid ConversationId`). Each chat thread contains an ordered sequence of user and AI assistant messages.
+5. **`Department` -> `Document` (Optional 1:N via `Guid? DepartmentId`):** A document may belong to a specific `Department` (for departmental RAG filtering) or have `DepartmentId = null` when shared workspace-wide.
 
 ---
 
@@ -196,15 +261,41 @@ public class TenantBranding
 
 ### The Fluent API Mapping
 ```csharp
-modelBuilder.Entity<Tenant>()
-    .HasOne(t => t.Branding)
-    .WithOne(b => b.Tenant)
-    .HasForeignKey<TenantBranding>(b => b.TenantId)
-    .OnDelete(DeleteBehavior.Cascade); // If Tenant is deleted, delete Branding!
+public sealed class TenantBrandingConfiguration : IEntityTypeConfiguration<TenantBranding>
+{
+    public void Configure(EntityTypeBuilder<TenantBranding> builder)
+    {
+        builder.HasOne(b => b.Tenant)
+               .WithOne(t => t.Branding)
+               .HasForeignKey<TenantBranding>(b => b.TenantId)
+               .OnDelete(DeleteBehavior.Cascade); // If Tenant is deleted, delete Branding!
+    }
+}
 ```
 
 ### Which entity holds the Foreign Key in One-to-One?
-The Foreign Key always goes on the **Dependent** entity (the one that cannot exist without the other). `TenantBranding` cannot exist without a `Tenant`, so `TenantBranding.TenantId` is the FK. You must explicitly specify which entity holds the FK via `HasForeignKey<TDependentEntity>()` — EF Core cannot guess this for One-to-One relationships.
+The Foreign Key always goes on the **Dependent** entity (the one that cannot exist without the other). `TenantBranding` cannot exist without a `Tenant`, so `TenantBranding.TenantId` is the FK. You must explicitly specify which entity holds the FK via `HasForeignKey<TDependentEntity>()`—EF Core cannot guess this for One-to-One relationships.
+
+Under the hood, EF Core automatically creates a **unique index** on `TenantBranding.TenantId` (`IX_TenantBrandings_TenantId`) in PostgreSQL. Without that unique constraint, nothing in SQL would stop two `TenantBranding` rows from pointing to the same `Tenant`, turning it into a One-to-Many relationship!
+
+### Two Other One-to-One Patterns (and When NOT to Use 1:1)
+1. **Shared Primary Key One-to-One:** Instead of a separate `TenantId` column, the dependent's primary key (`Id`) *is also* its foreign key to `Tenant.Id`:
+   ```csharp
+   builder.HasOne(p => p.Tenant)
+          .WithOne(t => t.Plan)
+          .HasForeignKey<TenantPlan>(p => p.Id); // Id is both PK and FK!
+   ```
+   This saves an extra column and index, and guarantees strict 1:1 cardinality via the primary key itself.
+2. **Table Splitting:** Both `Document` and `DocumentExtractionDetail` share the same primary key *and* map to the **exact same PostgreSQL table** (`builder.ToTable("Documents")`). You load lightweight `Document` rows quickly and only fetch heavy extracted text columns when needed—without a SQL `JOIN`.
+3. **When NOT to Use a Separate 1:1 Table:** Don't create a 1:1 table just to group 3–4 columns that are always loaded with the parent (for example, an address or money amount). Use an EF Core **Complex Type** (covered in Module 8) so those columns live directly on the parent table without a `JOIN`.
+
+### Five Real-World Normora Examples (One-to-One)
+
+1. **`Tenant` <-> `TenantBranding` (Separate FK 1:1):** Each workspace has at most one custom white-label branding configuration (primary color, MinIO logo key) stored in `TenantBrandings` with a unique `TenantId` FK.
+2. **`Tenant` <-> `TenantPlan` (Shared PK or Unique FK 1:1):** Each workspace has one active subscription tier (`Free`, `Pro`, `Enterprise`), currency (`INR`, `USD`, etc.), and billing cycle governed by `TenantPlanPricingCatalog`.
+3. **`TenantMembership` <-> `UserProfile` (1:1):** Separates workspace-scoped authorization state (`Role`, `IsActive`) from extended user profile preferences without bloating membership queries.
+4. **`Document` <-> `DocumentExtractionPayload` (Table Splitting 1:1):** Keeps heavy extracted raw text in the same `Documents` table while projecting only lightweight metadata during `documents_list` tool calls.
+5. **`Message` <-> `SavedAnswer` (Optional 1:1):** An assistant `Message` in `ConversationsDbContext` may optionally be bookmarked as one `SavedAnswer` (`Guid? SourceMessageId` with a unique filtered index).
 
 ---
 
@@ -239,41 +330,101 @@ modelBuilder.Entity<User>()
 ### Many-to-Many with an Explicit Join Entity (Normora Example)
 In Normora, a User doesn't just join a Department. A user has a `TenantMembership`, and that membership is assigned to a `Department`. We need to track exactly when they joined the department, or perhaps their specific role in it. We use an explicit join entity called `MembershipDepartment`.
 
+```mermaid
+erDiagram
+    TenantMembership ||--o{ MembershipDepartment : "assigned to"
+    Department ||--o{ MembershipDepartment : "contains"
+
+    TenantMembership {
+        uuid Id PK
+        uuid TenantId FK
+        string ExternalUserId
+    }
+    MembershipDepartment {
+        uuid TenantMembershipId PK,FK
+        uuid DepartmentId PK,FK
+        datetime AssignedAt
+    }
+    Department {
+        uuid Id PK
+        uuid TenantId FK
+        string Name
+    }
+```
+
 ```csharp
 public class MembershipDepartment
 {
     // Composite Primary Key (TenantMembershipId + DepartmentId)
     public Guid TenantMembershipId { get; set; }
-    public TenantMembership TenantMembership { get; set; }
+    public TenantMembership TenantMembership { get; set; } = null!;
 
     public Guid DepartmentId { get; set; }
-    public Department Department { get; set; }
+    public Department Department { get; set; } = null!;
+
+    public DateTimeOffset AssignedAt { get; set; }
 }
 ```
 
-When you do this, you are actually creating **two One-to-Many relationships** that form a Many-to-Many. Here is exactly how Normora configures this in `TenantsDbContext`:
+When you do this, you are actually creating **two One-to-Many relationships** that form a Many-to-Many. Here is how Normora configures this in `MembershipDepartmentConfiguration`:
 
 ```csharp
-modelBuilder.Entity<MembershipDepartment>(entity =>
+public sealed class MembershipDepartmentConfiguration : IEntityTypeConfiguration<MembershipDepartment>
 {
-    // 1. Define the composite primary key
-    entity.HasKey(md => new { md.TenantMembershipId, md.DepartmentId });
+    public void Configure(EntityTypeBuilder<MembershipDepartment> builder)
+    {
+        // 1. Define the composite primary key
+        builder.HasKey(md => new { md.TenantMembershipId, md.DepartmentId });
 
-    // 2. Map TenantMembership -> MembershipDepartment
-    entity.HasOne(md => md.TenantMembership)
-          .WithMany(m => m.MembershipDepartments)
-          .HasForeignKey(md => md.TenantMembershipId)
-          .OnDelete(DeleteBehavior.Cascade); // If membership is removed, remove from department
+        // 2. Map TenantMembership -> MembershipDepartment
+        builder.HasOne(md => md.TenantMembership)
+               .WithMany(m => m.MembershipDepartments)
+               .HasForeignKey(md => md.TenantMembershipId)
+               .OnDelete(DeleteBehavior.Cascade); // If membership is removed, remove from department
 
-    // 3. Map Department -> MembershipDepartment
-    entity.HasOne(md => md.Department)
-          .WithMany(d => d.MembershipDepartments)
-          .HasForeignKey(md => md.DepartmentId)
-          .OnDelete(DeleteBehavior.Restrict); // PREVENT deleting a department if members still exist in it!
-});
+        // 3. Map Department -> MembershipDepartment
+        builder.HasOne(md => md.Department)
+               .WithMany(d => d.MembershipDepartments)
+               .HasForeignKey(md => md.DepartmentId)
+               .OnDelete(DeleteBehavior.Restrict); // PREVENT deleting a department if members still exist in it!
+    }
+}
 ```
 
 **Best Practice:** Notice the `.OnDelete(DeleteBehavior.Restrict)` above. Explicit join entities allow you to control delete cascading precisely. In this case, Normora ensures you cannot accidentally delete a `Department` if people are still actively assigned to it!
+
+### Skip Navigations With a Payload (`UsingEntity<TJoin>()`)
+What if you want the convenience of `membership.Departments` (called a **Skip Navigation** because it skips over the join table) *and* you still need extra columns like `AssignedAt`? Modern EF Core lets you combine both worlds:
+
+```csharp
+builder.HasMany(m => m.Departments)
+       .WithMany(d => d.Memberships)
+       .UsingEntity<MembershipDepartment>(
+           right => right.HasOne(md => md.Department)
+                         .WithMany(d => d.MembershipDepartments)
+                         .HasForeignKey(md => md.DepartmentId)
+                         .OnDelete(DeleteBehavior.Restrict),
+           left => left.HasOne(md => md.TenantMembership)
+                       .WithMany(m => m.MembershipDepartments)
+                       .HasForeignKey(md => md.TenantMembershipId)
+                       .OnDelete(DeleteBehavior.Cascade),
+           join => join.HasKey(md => new { md.TenantMembershipId, md.DepartmentId }));
+```
+
+### When NOT to Use Implicit Many-to-Many
+Avoid implicit join tables (`.HasMany().WithMany()` without a join class) whenever:
+1. You need payload columns (`AssignedAt`, `AssignedByUserId`, `Role`).
+2. You need custom delete behavior (`DeleteBehavior.Restrict`) on one side of the join.
+3. You need global query filters (`TenantId` or `IsDeleted`) directly on the join entity.
+4. You want to query or remove join rows directly via `dbContext.Set<TJoin>()` without loading both sides into memory.
+
+### Five Real-World Normora Examples (Many-to-Many)
+
+1. **`TenantMembership` <-> `Department` via `MembershipDepartment`:** Explicit join entity with composite PK, `AssignedAt` metadata, and `DeleteBehavior.Restrict` protecting active departments.
+2. **`TenantMembership` <-> `UserGroup` via `UserGroupMember`:** Explicit join linking workspace members into security groups that control RAG document visibility.
+3. **`Document` <-> `UserGroup` via `DocumentGroupAccess` (`DocumentsDbContext`):** Explicit join controlling which `UserGroupId`s can retrieve chunks from a confidential `Document` during hybrid search.
+4. **`Document` <-> `DocumentTag` (Implicit M:N):** If documents simply carry free-form tags with no per-link metadata, `.HasMany(d => d.Tags).WithMany(t => t.Documents).UsingEntity(j => j.ToTable("DocumentTags"))` keeps C# code minimal.
+5. **Skip Navigation + Payload on `TenantMembership.Departments`:** Allows RBAC queries to write `membership.Departments.Select(d => d.Name)` cleanly while `MembershipDepartment` still enforces `DeleteBehavior.Restrict` and audits `AssignedAt`.
 
 ---
 
@@ -308,7 +459,7 @@ It only tells the JSON serialization layer: *"Don't serialize this navigation pr
 | Approach | How | Best for |
 |---|---|---|
 | `[JsonIgnore]` on nav property | Attribute on one side of the relationship | Simple apps; quick fix |
-| DTOs + `.Select()` projection | Never return raw EF entities from API | Enterprise apps; recommended |
+| DTOs + `.Select()` projection | Never return raw EF entities from API | Enterprise apps (Normora standard); recommended |
 | Global `IgnoreCycles` setting | Configure JSON serializer in `Program.cs` | Quick global fix; less control |
 
 ```csharp
@@ -318,6 +469,20 @@ builder.Services.AddControllers().AddJsonOptions(options =>
     options.JsonSerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles;
 });
 ```
+
+### When NOT to Rely on `[JsonIgnore]` or `IgnoreCycles`
+In enterprise modular monoliths like Normora, returning raw EF Core entities from controllers—even with `[JsonIgnore]`—is an architectural mistake for three reasons:
+1. **Over-fetching & Bandwidth Waste:** `ReferenceHandler.IgnoreCycles` silently sets cyclic properties to `null` *after* EF Core has already fetched huge object graphs from PostgreSQL.
+2. **Accidental Data Exposure & BOLA Risk:** Returning a raw `TenantMembership` entity can leak internal fields (`ExternalUserId`, `TenantId`, internal status flags) to the browser.
+3. **Tight Coupling:** Any schema refactor breaks the Angular SPA contract. Always project directly into explicit records inside `Application/{Feature}/DTOs/`.
+
+### Five Real-World Normora Examples (Serialization Boundaries)
+
+1. **`Tenants` Employee Directory (`TenantMembershipDto`):** Instead of returning `TenantMembership` -> `Tenant` -> `Memberships`, `GetEmployeesQueryHandler` projects `.Select(m => new EmployeeDto(m.Id, m.DisplayName, m.Role, ...))`.
+2. **`Documents` Upload & Version List (`DocumentDto`):** `DocumentsController` maps `Document` + `DocumentVersions` into `DocumentSummaryDto` so internal `DocumentChunks` (containing 768-dimension pgvector embeddings) are never serialized over HTTP.
+3. **`Conversations` Thread History (`ConversationDetailDto`):** `ConversationsController` projects `Conversation` -> `Messages` -> `Citations` into flat DTOs instead of returning bidirectional entity graphs.
+4. **`Tenants` Branding Endpoint (`TenantBrandingDto`):** Even if `TenantBranding.Tenant` carries `[JsonIgnore]` as a safety net, `BrandingController` returns `TenantBrandingDto` containing only colors and public logo URLs.
+5. **`Conversations` HITL Approvals (`PendingApprovalDto`):** `ApprovalsController` projects pending tool-execution cards (`ApprovalId`, `ToolName`, `ExpiresAt`) without serializing the parent `Conversation` or `Message` graph.
 
 ---
 

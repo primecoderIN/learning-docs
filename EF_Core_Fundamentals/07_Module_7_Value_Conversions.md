@@ -1,23 +1,53 @@
 # Module 7: The Change Tracker, Concurrency, and Value Conversions
 
-In this final module, we will explore advanced EF Core concepts that are essential for building robust enterprise applications. We will dive deep into the **Change Tracker**, learn how to boost read performance with `AsNoTracking`, handle data conflicts with **Concurrency Tokens**, and bridge the gap between C# types and SQL types using **Value Conversions**.
+In this module, we will explore essential EF Core 10 persistence concepts for building robust enterprise applications. We will dive into the **Change Tracker**, learn how to boost read performance with `AsNoTracking` and `AsNoTrackingWithIdentityResolution`, protect data integrity with **Optimistic Concurrency** (including PostgreSQL's `xmin`), and bridge the gap between rich C# domain types and database columns using **Value Conversions**, **`ValueComparer<T>`**, and **`ConfigureConventions`**.
 
 ---
 
 ## 1. The Change Tracker and Entity States
 
-The **Change Tracker** is the heart of Entity Framework Core. When you query entities from the database, EF Core doesn't just return objects; it actively monitors them.
+The **Change Tracker** is the heart of Entity Framework Core. When you query entities from the database, EF Core doesn't just return plain objects; it stores an internal **original-values snapshot** for each tracked entity and monitors property changes so it knows what SQL to emit on `SaveChangesAsync()`.
 
 Every entity tracked by the `DbContext` has an `EntityState`. There are five possible states:
 
-1.  **`Unchanged`:** The entity was queried from the database and has not been modified. (`SaveChanges` ignores it).
-2.  **`Modified`:** The entity was queried, and one or more of its properties have been changed in C#. (`SaveChanges` generates an `UPDATE`).
-3.  **`Added`:** The entity is new and was added to the context (e.g., via `context.Add()`). It does not exist in the database yet. (`SaveChanges` generates an `INSERT`).
-4.  **`Deleted`:** The entity was marked for deletion (e.g., via `context.Remove()`). (`SaveChanges` generates a `DELETE`).
-5.  **`Detached`:** The entity is not being tracked by the `DbContext`. This happens if you instantiate it manually without adding it, or if you use `AsNoTracking()`.
+1.  **`Unchanged`:** The entity was queried from the database and has not been modified. (`SaveChangesAsync` ignores it).
+2.  **`Modified`:** The entity was queried, and one or more of its properties have been changed in C#. (`SaveChangesAsync` generates an `UPDATE` containing only the modified columns).
+3.  **`Added`:** The entity is new and was added to the context (e.g., via `context.Add()`). It does not exist in the database yet. (`SaveChangesAsync` generates an `INSERT`).
+4.  **`Deleted`:** The entity was marked for deletion (e.g., via `context.Remove()`). (`SaveChangesAsync` generates a `DELETE`).
+5.  **`Detached`:** The entity is not being tracked by the `DbContext`. This happens if you instantiate it manually without adding it, call `ChangeTracker.Clear()`, or query with `AsNoTracking()`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detached : "new Entity() or AsNoTracking()"
+    [*] --> Unchanged : "Tracked query from DB"
+    Detached --> Added : "dbContext.Add()"
+    Detached --> Unchanged : "dbContext.Attach()"
+    Detached --> Modified : "dbContext.Update()"
+    Unchanged --> Modified : "Property mutated + DetectChanges()"
+    Unchanged --> Deleted : "dbContext.Remove()"
+    Added --> Unchanged : "SaveChangesAsync() commits INSERT"
+    Modified --> Unchanged : "SaveChangesAsync() commits UPDATE"
+    Deleted --> Detached : "SaveChangesAsync() commits DELETE"
+```
 
 ### How SaveChanges Works
-When you call `await context.SaveChangesAsync()`, EF Core loops through the Change Tracker. It ignores `Unchanged` and `Detached` entities. For the rest, it generates the appropriate SQL statements, wraps them all in a **single database transaction**, and executes them. 
+When you call `await context.SaveChangesAsync(ct)`, EF Core runs `DetectChanges()` (comparing current property values against the stored snapshots), ignores `Unchanged` and `Detached` entities, generates the minimal `INSERT`/`UPDATE`/`DELETE` SQL statements, wraps them all in a **single database transaction**, and executes them. Once committed, `Added` and `Modified` entities transition to `Unchanged`, and `Deleted` entities become `Detached`.
+
+> [!TIP]
+> **When NOT to keep entities tracked:** In long-running Hangfire background jobs (like Normora's `Normora.Worker` processing thousands of document chunks), keeping thousands of tracked entities in the same `DbContext` causes memory bloat and slows down `DetectChanges()` ($O(N)$ snapshot scans). Call `dbContext.ChangeTracker.Clear()` between batches, or use `ExecuteUpdateAsync` / `ExecuteDeleteAsync` for set-based operations.
+
+### 5 Real-World Normora Examples (Change Tracker & Entity States)
+
+1. **Atomic Multi-Entity `Added` State in `UploadDocumentCommandHandler` (`Documents` Module):**
+   When a user uploads a policy PDF, `UploadDocumentCommandHandler` calls `documentsDbContext.Add(...)` for `Document`, `DocumentVersion`, and `DocumentProcessingOutboxMessage`. All three start in `Added` state and commit in one PostgreSQL transaction via a single `SaveChangesAsync(ct)` call.
+2. **Targeted `Modified` Column Updates in `UpdateTenantCurrencyCommandHandler` (`Tenants` Module):**
+   Querying `TenantPlan` (tracked as `Unchanged`) and setting `plan.Currency = request.Currency;` marks only `Currency` as modified. EF Core emits `UPDATE tenants."TenantPlans" SET "Currency" = @p0 WHERE "Id" = @p1` rather than overwriting unrelated quota or billing columns.
+3. **Batch Ingestion Cleanup with `ChangeTracker.Clear()` (`Documents` Module / `Normora.Worker`):**
+   During `DocumentProcessingJob`, after inserting each batch of 100 `DocumentChunk` rows with pgvector embeddings and calling `SaveChangesAsync(ct)`, the worker calls `documentsDbContext.ChangeTracker.Clear()` so large vector arrays (`float[]` / `Vector`) are released for garbage collection immediately.
+4. **Soft Delete (`Modified`) vs Hard Delete (`Deleted`) on `Document` (`Documents` Module):**
+   Archiving a document updates `document.IsDeleted = true` (`EntityState.Modified`), whereas permanently purging expired quarantine records calls `documentsDbContext.Documents.Remove(doc)` (`EntityState.Deleted`), emitting a SQL `DELETE`.
+5. **Disconnected `Attach()` for Status Updates (`Documents` Module):**
+   When a background callback receives only a `DocumentId` and new `DocumentStatus.Indexed`, attaching a stub entity (`Attach`) and setting `Entry(doc).Property(d => d.Status).IsModified = true` avoids an extra `SELECT` round-trip (note: ensure required concurrency tokens or global filters are respected).
 
 ---
 

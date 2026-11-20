@@ -1,103 +1,197 @@
 # Module 6: Querying, Deferred Execution, and Projections
 
-When querying data in EF Core, the key to high performance is understanding **where the execution happens**: does filtering and projection happen in the **database**, or does it happen after the data has already been loaded into your application's memory?
+When querying data in EF Core 10, the key to high performance and multi-tenant security is understanding **where and when execution happens**: does filtering, joining, grouping, and projection happen inside **PostgreSQL**, or after rows have already been pulled into your .NET application's memory?
 
-Let's explore the critical difference using our Normora `Tenant` and `User` entities.
+Let's explore how EF Core translates LINQ expressions into SQL—from deferred execution basics to architect-level split queries, keyset pagination, `GroupBy` rules, EF Core 10 Named Query Filters, and `pgvector` raw SQL—using our **Normora** modular monolith (`Tenants`, `Documents`, and `Conversations`).
 
 ---
 
-## 1. Deferred Execution: `IQueryable` vs `IEnumerable` vs `List`
+## 1. Deferred Execution: `IQueryable` vs `IEnumerable` vs `List` vs `IAsyncEnumerable`
 
-You can achieve deferred execution without using `IQueryable<T>`. However, it depends heavily on *what* you are executing and *when* you want the execution to happen.
+Before writing a single query, you need to understand **deferred execution** (building a query recipe without running it yet) versus **immediate execution** (sending SQL to PostgreSQL right now), and where **expression trees** fit in.
 
-Let's understand this using the `Tenant` entity in Normora.
+- An **Expression Tree** (`Expression<Func<T, bool>>`) is a data structure representing code as inspectable nodes (e.g., `d.Status == DocumentStatus.Ready`). EF Core walks this tree and translates it into SQL.
+- A **Delegate** (`Func<T, bool>`) is compiled IL machine code. EF Core **cannot** inspect inside a compiled delegate, so anything using delegates runs in .NET memory.
 
-### A. Using `IQueryable<T>` — Deferred execution in SQL
+```mermaid
+flowchart LR
+    A["DbSet&lt;Document&gt; (IQueryable)"] --> B["Chain .Where(), .OrderBy(), .Select()"]
+    B --> C["Global Query Filters Injected"]
+    C --> D{"Terminal Operator? (ToListAsync, FirstOrDefaultAsync, CountAsync)"}
+    D -- "Not Yet" --> B
+    D -- "Yes (IQueryable)" --> E["EF Core Translates Expression Tree to SQL"]
+    E --> F["PostgreSQL Executes Filtered SQL"]
+    F --> G["Only Matching Columns/Rows Materialized"]
+    B -- "AsEnumerable() / ToListAsync() Early" --> H["SELECT * Sent to PostgreSQL"]
+    H --> I["Full Table Pulled Into .NET RAM"]
+    I --> J["LINQ-to-Objects Filters in Memory"]
+```
+
+*(Note: Keep the `IQueryable` pipeline intact all the way to the final `ToListAsync()` or `FirstOrDefaultAsync()` call so PostgreSQL does the heavy lifting.)*
+
+### A. Using `IQueryable<T>` — Deferred Execution in SQL
 
 ```csharp
-IQueryable<Tenant> tenants = db.Tenants;
+IQueryable<Document> documents = dbContext.Documents;
 
-var filteredTenants = tenants
-    .Where(t => t.CreatedYear == 2024);
+var readyDocuments = documents
+    .Where(d => d.Status == DocumentStatus.Ready);
 ```
 
 At this point:
-* EF Core has an expression describing the query.
-* The SQL has not necessarily been generated yet.
+* EF Core holds an **expression tree** describing the query.
+* No SQL has been sent to PostgreSQL yet.
 * **The database has not been queried yet.**
 
-Now execute it:
+Now execute it with an async terminal operator:
 
 ```csharp
-var result = await filteredTenants.ToListAsync();
+var result = await readyDocuments.ToListAsync(cancellationToken);
 ```
 
 At this point:
-1. EF Core translates the expression into SQL.
-2. EF Core sends the SQL to the database.
-3. The database executes the query.
-4. The matching Tenants are returned and materialized into a `List<Tenant>`.
+1. EF Core injects any active Global Query Filters (such as `TenantId` and `!IsDeleted`) and translates the expression tree into parameterized PostgreSQL SQL.
+2. EF Core sends the SQL to PostgreSQL.
+3. PostgreSQL executes the `WHERE` filter using its indexes.
+4. Only the matching `Document` rows are returned and materialized into a `List<Document>`.
 
-### Remember the sequence
-`IQueryable` → Build query → `ToListAsync()` → Translate to SQL → Execute against database → Return results.
+### Remember the Sequence
+`IQueryable` -> Compose `.Where()` / `.OrderBy()` / `.Select()` -> Terminal operator (`ToListAsync`, `FirstOrDefaultAsync`, `SingleOrDefaultAsync`, `CountAsync`, `AnyAsync`) -> Translate to SQL -> Execute in PostgreSQL -> Return results.
 
-*Important:* `ToListAsync()` is one way to execute a query, but it's not the only one. Methods such as `FirstOrDefaultAsync()`, `SingleOrDefaultAsync()`, and `CountAsync()` also trigger the exact same execution sequence against the database!
-
-### B. Using `IEnumerable<T>` — Deferred execution in Memory
-
-You can also use `IEnumerable<T>`:
+### B. Using `IEnumerable<T>` — Deferred Execution in Memory
 
 ```csharp
-IEnumerable<Tenant> tenants = db.Tenants
+IEnumerable<Document> documents = dbContext.Documents
     .AsEnumerable()
-    .Where(t => t.CreatedYear == 2024);
+    .Where(d => d.Status == DocumentStatus.Ready);
 
-// The filtering operation is deferred.
+// Still deferred! Nothing has hit PostgreSQL yet.
 
-var result = tenants.ToList();
+var result = documents.ToList();
 ```
 
 **Here is what happens:**
-1. `AsEnumerable()` switches subsequent LINQ operations to LINQ-to-Objects.
-2. The database query (`SELECT * FROM Tenants`) executes when enumeration begins (at `.ToList()`).
-3. **The `Where()` filtering happens in memory, not in SQL.**
-
-*Important:* `AsEnumerable()` itself does not immediately execute the query. However, when enumeration starts, EF Core retrieves the database results, and the subsequent filtering happens in memory. For a large table, this retrieves massive amounts of unnecessary records!
+1. `AsEnumerable()` switches subsequent LINQ operators from `IQueryable<T>` (expression trees) to `IEnumerable<T>` (**LINQ-to-Objects** delegates).
+2. When `.ToList()` starts enumerating, EF Core executes `SELECT ... FROM documents."Documents"` **without** the `.Where(d => d.Status == DocumentStatus.Ready)` predicate.
+3. **The `Status` filter executes in .NET memory after pulling every tenant document over the network.**
 
 ### C. Using `List<T>` — Immediate Database Execution
 
 ```csharp
-List<Tenant> tenants = await db.Tenants.ToListAsync();
+List<Document> documents = await dbContext.Documents.ToListAsync(cancellationToken);
 
-var result = tenants
-    .Where(t => t.CreatedYear == 2024)
+var result = documents
+    .Where(d => d.Status == DocumentStatus.Ready)
     .ToList();
 ```
 
 **Here:**
 * `ToListAsync()` immediately executes the database query.
-* All retrieved tenants are loaded into memory.
-* `Where()` executes when the in-memory collection is enumerated.
+* All retrieved documents are loaded into .NET memory.
+* `Where()` executes later in memory when `.ToList()` runs.
 
-So, **the filtering is deferred, but the database query is not.**
+### D. Using `IAsyncEnumerable<T>` — Streaming Without Buffering (`AsAsyncEnumerable`)
 
-### D. Comparison Matrix
+What if a Normora background job in `Normora.Worker` needs to export 200,000 `AuditLog` entries to a stream without loading all 200,000 objects into RAM at once?
 
-| Feature | `IQueryable<T>` | `IEnumerable<T>` | `List<T>` |
-| :--- | :--- | :--- | :--- |
-| **Supports deferred execution?** | Yes | Yes, for deferred LINQ operators | No, for the initial database retrieval |
-| **Builds expression trees?** | Yes | No, subsequent LINQ operations use delegates | No |
-| **Filtering location** | Usually database (via SQL) | In memory after switching to LINQ-to-Objects | In memory |
-| **SQL execution happens...** | When enumerated (e.g. `ToListAsync`) | When enumerated, if backed by an unexecuted EF query | Already executed when populated using `ToListAsync()` |
-| **Can translate LINQ to SQL?** | Yes | Not for LINQ operations performed *after* switching to LINQ-to-Objects | No |
+* `ToListAsync()` buffers **every** row into a `List<T>` in memory before returning.
+* `AsAsyncEnumerable()` streams rows from PostgreSQL one-by-one (via `await foreach`) while keeping the `WHERE` filter and projection on the database!
+
+```csharp
+await foreach (var log in tenantsDbContext.AuditLogs
+    .Where(a => a.TenantId == tenantId && a.CreatedAt >= cutoff)
+    .OrderBy(a => a.CreatedAt)
+    .Select(a => new AuditExportRow(a.CreatedAt, a.Action, a.ActorExternalUserId))
+    .AsAsyncEnumerable()
+    .WithCancellation(cancellationToken))
+{
+    await csvWriter.WriteRowAsync(log);
+}
+```
+
+**When NOT to use `AsAsyncEnumerable()`:** Do not use it for normal REST API endpoints returning paginated lists (`Take(20)`), or if you plan to call other `DbContext` queries on the **same** `DbContext` instance inside the `await foreach` loop—an open data reader keeps the connection busy, and `DbContext` does not support concurrent operations on a single instance.
+
+### E. Comparison Matrix
+
+| Feature | `IQueryable<T>` | `IEnumerable<T>` | `List<T>` | `IAsyncEnumerable<T>` |
+| :--- | :--- | :--- | :--- | :--- |
+| **Supports deferred execution?** | Yes | Yes | No (initial query already ran) | Yes |
+| **Builds expression trees?** | Yes | No (uses delegates after `AsEnumerable`) | No | Preserves upstream `IQueryable` SQL |
+| **Filtering location** | PostgreSQL (via SQL) | .NET memory (after `AsEnumerable`) | .NET memory | PostgreSQL (via SQL) |
+| **Memory profile** | Translates; materializes at terminal call | Buffers when iterated/converted | Buffers all rows in RAM at once | Streams row-by-row (constant memory) |
+| **Best used for** | Composing dynamic database queries | In-memory C# filtering on small data | Caching/reusing small fetched sets | Large exports & streaming workers |
 
 ### The Key Takeaway
 **Deferred execution and `IQueryable<T>` are not the same thing.**
-* `IQueryable<T>` allows EF Core to build a query expression and translate it into SQL when executed.
-* `IEnumerable<T>` supports deferred in-memory iteration and can also wrap an unexecuted EF Core query.
-* `List<T>` represents an already-materialized collection, although further LINQ operations on it can still be deferred.
+* `IQueryable<T>` lets EF Core compose an expression tree and translate it into SQL.
+* `IEnumerable<T>` supports deferred in-memory iteration; calling `.AsEnumerable()` on a `DbSet` cuts off SQL translation for everything chained afterward.
+* `IAsyncEnumerable<T>` keeps SQL translation intact while streaming results asynchronously without buffering a huge `List<T>`.
 
-> **Rule:** For database filtering, always prefer `IQueryable<T>` so EF Core can translate the filtering into SQL and avoid retrieving unnecessary records.
+> **Rule:** For database filtering, always keep your query as `IQueryable<T>` until the final async terminal operator. Never return `IQueryable<T>` out of a `using`/disposed `DbContext` scope—materialize it inside the CQRS handler before the `DbContext` is disposed.
+
+### 5 Real-World Normora Examples (Deferred Execution)
+
+1. **Dynamic Optional Filters in `GetDocumentsQueryHandler` (`Documents` Module):**
+   Because `IQueryable<Document>` is deferred, you can conditionally append `.Where()` clauses for optional UI filters (`DepartmentId`, `Status`, search text) and execute **one** optimized SQL query at the end:
+   ```csharp
+   // server/Modules/Documents/Application/Documents/Queries/GetDocuments/GetDocumentsQueryHandler.cs
+   IQueryable<Document> query = dbContext.Documents;
+
+   if (request.DepartmentId.HasValue)
+       query = query.Where(d => d.DepartmentId == request.DepartmentId.Value);
+
+   if (request.Status.HasValue)
+       query = query.Where(d => d.Status == request.Status.Value);
+
+   var items = await query
+       .OrderByDescending(d => d.CreatedAt)
+       .Select(d => new DocumentSummaryDto(d.Id, d.FileName, d.Status, d.CreatedAt))
+       .Take(20)
+       .ToListAsync(cancellationToken);
+   ```
+
+2. **Existence Check Without Materializing Entities (`AnyAsync`):**
+   Using `.AnyAsync()` as the terminal operator compiles to `SELECT EXISTS (SELECT 1 ...)` in PostgreSQL, returning a single `bool` without loading any columns:
+   ```csharp
+   bool hasPendingApprovals = await conversationsDbContext.PendingApprovals
+       .Where(p => p.ConversationId == conversationId && p.ExpiresAt > DateTime.UtcNow)
+       .AnyAsync(cancellationToken);
+   ```
+
+3. **Scalar Count Query (`CountAsync`) for `TenantPlan` Quota Enforcement:**
+   Before uploading a new file, `UploadDocumentCommandHandler` checks the workspace quota using `CountAsync()`, which runs `SELECT COUNT(*)` in PostgreSQL instead of loading entities:
+   ```csharp
+   int currentDocCount = await documentsDbContext.Documents
+       .Where(d => d.Status != DocumentStatus.Failed)
+       .CountAsync(cancellationToken);
+   ```
+
+4. **Streaming Audit Export in `Normora.Worker` (`AsAsyncEnumerable`):**
+   An enterprise compliance export streams `AuditLogs` from `TenantsDbContext` (explicitly filtering `TenantId` per Normora's unscoped-root rule) row-by-row without spiking container memory:
+   ```csharp
+   await foreach (var entry in tenantsDbContext.AuditLogs
+       .Where(a => a.TenantId == job.TenantId && a.CreatedAt >= job.FromUtc)
+       .OrderBy(a => a.CreatedAt)
+       .Select(a => new AuditLogCsvDto(a.CreatedAt, a.Action, a.ActorExternalUserId))
+       .AsAsyncEnumerable()
+       .WithCancellation(cancellationToken))
+   {
+       await writer.WriteAsync(entry, cancellationToken);
+   }
+   ```
+
+5. **Safe Boundary: Materializing Inside the Handler Before Returning (Avoiding `ObjectDisposedException`):**
+   Never return an unexecuted `IQueryable<Conversation>` from a MediatR handler or helper whose `DbContext` lifetime is about to end; always terminate with `ToListAsync` / `FirstOrDefaultAsync` inside the handler:
+   ```csharp
+   // server/Modules/Conversations/Application/Conversations/Queries/GetConversations/GetConversationsQueryHandler.cs
+   var conversations = await conversationsDbContext.Conversations
+       .Where(c => c.ExternalUserId == currentUser.ExternalUserId)
+       .OrderByDescending(c => c.UpdatedAt)
+       .Select(c => new ConversationListItemDto(c.Id, c.Title, c.UpdatedAt))
+       .ToListAsync(cancellationToken);
+
+   return conversations;
+   ```
 
 ---
 

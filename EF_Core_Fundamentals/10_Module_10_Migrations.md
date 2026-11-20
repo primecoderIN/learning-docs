@@ -1,176 +1,272 @@
 # Module 10: Database Migrations in EF Core
 
-When you build an application with Entity Framework Core, your primary source of truth is your C# code (your Domain Entities and Fluent API configurations). However, a relational database needs a physical schema (Tables, Columns, Primary Keys, Foreign Keys) to store that data.
+When you build an application with Entity Framework Core 10, your primary source of truth is your C# code (your Domain Entities and `IEntityTypeConfiguration<T>` Fluent API configurations). However, a relational database—such as **PostgreSQL** (used by **Normora** with the `pgvector` extension) or SQL Server—needs a physical **schema** (tables, columns, indexes, primary keys, and foreign keys) to store that data.
 
-How do you keep the C# code and the SQL Server schema perfectly synchronized as your application evolves? The answer is **Migrations**.
+How do you keep your C# domain models and your relational database schema perfectly synchronized as your application evolves from Sprint 1 to Year 5? The answer is **Migrations**.
 
 ---
 
 ## 1. What is a Migration?
 
-A **Migration** is an auto-generated set of instructions (written in C#) that tells EF Core exactly how to alter the database schema to match the current state of your `DbContext`. 
+A **Migration** is an auto-generated, versioned set of instructions (written in C#) that tells EF Core exactly how to alter the database schema to match the current state of a `DbContext`.
 
-Think of a migration as a "git commit" for your database. 
+Think of a migration as a **Git commit for your database schema**.
 
-Every time you change your C# models (e.g., adding a new `Age` property to the `User` class), you create a new Migration. EF Core looks at the old state of the database, looks at the new state of your C# code, and generates a file that basically says: *"To get from State A to State B, execute `ALTER TABLE Users ADD Age INT NULL`."*
+Every time you change your C# entity models or Fluent API mappings (for example, adding a `Currency` column to Normora's `TenantPlan` entity), you generate a new migration. EF Core compares your current C# model against a saved **Model Snapshot** of the previous state and generates a file containing **DDL** (*Data Definition Language*—SQL statements like `CREATE TABLE`, `ALTER TABLE`, and `CREATE INDEX` that define database structure rather than row data): *"To move from State A to State B, execute `ALTER TABLE tenants."TenantPlans" ADD "Currency" character varying(3) NOT NULL DEFAULT 'USD'`."*
 
-When you apply the migration, EF Core translates those C# instructions into pure SQL and runs them against your database.
+When you apply the migration, EF Core translates those C# instructions into provider-specific SQL (PostgreSQL via `Npgsql`, SQL Server via `SqlClient`, etc.) and executes them inside a transaction.
+
+### Real-World Normora Migration Scenarios (What Migrations Handle)
+1. **Tenants Module (`TenantsDbContext`) — Billing Currency:** Adding `Currency` to `TenantPlan` so workspaces can persist `INR`, `USD`, `EUR`, or `GBP` pricing from `TenantPlanPricingCatalog`.
+2. **Documents Module (`DocumentsDbContext`) — Vector Search:** Enabling the PostgreSQL `vector` extension and adding a `vector` column plus an **HNSW** (*Hierarchical Navigable Small World*, an approximate nearest-neighbor vector index) on `DocumentChunk` for semantic retrieval.
+3. **Documents Module (`DocumentsDbContext`) — Transactional Outbox:** Creating the `DocumentProcessingOutboxMessages` table so `UploadDocumentCommandHandler` can atomically persist upload metadata and background-job dispatch state in one transaction.
+4. **Conversations Module (`ConversationsDbContext`) — HITL Approvals:** Adding the `PendingApprovals` table with a 15-minute expiration timestamp (`ExpiresAt`) to support two-phase Human-In-The-Loop agent tool execution.
+5. **Tenants Module (`TenantsDbContext`) — Vendor-Neutral Identity:** Renaming or backfilling `ExternalUserId` on `TenantMembership` so OIDC subject identifiers from Keycloak remain decoupled from vendor-specific column names.
 
 ---
 
-## 2. WHY do we need Migrations? 
+## 2. WHY do we need Migrations?
 
-Before Migrations existed, developers used to manually write SQL scripts to update the database, or they would delete the entire database and recreate it every time they changed a C# class (a feature called `EnsureCreated()`). 
+Before migrations existed, developers either hand-wrote fragile SQL scripts in shared folders or wiped and recreated the database on every model change (similar to calling `Database.EnsureCreated()`).
 
-In a production enterprise environment, neither of those approaches work. We need Migrations for three critical reasons:
+In an enterprise multi-tenant system like Normora, neither approach survives production. We need migrations for four critical reasons:
 
-### 1. Version Control for your Schema
-Your database schema evolves over time. Migrations create a historical timeline of exactly how your database changed from Day 1 to Year 5. Because migrations are just `.cs` files, they get committed to your Git repository alongside your normal code. This ensures your code and your database schema are always perfectly aligned in history.
+### 1. Version Control for Your Schema
+Your database schema evolves alongside your application features. Migrations create an auditable, chronological timeline from Day 1 to Year 5. Because migrations are plain `.cs` files committed to Git right next to your CQRS handlers and `IEntityTypeConfiguration<T>` classes, a specific Git commit always knows the exact database schema it expects.
 
-### 2. Team Collaboration
-Imagine you are building Normora on a team of 5 developers.
-*   Developer A adds a `StripeCustomerId` column to the `Tenants` table.
-*   Developer B adds an `IsActive` column to the `Users` table.
+### 2. Safe Team Collaboration
+Imagine two engineers working on Normora concurrently:
+*   Engineer A adds a `Currency` column to `tenants."TenantPlans"` in `TenantsDbContext`.
+*   Engineer B adds a `Status` index on `documents."DocumentProcessingOutboxMessages"` in `DocumentsDbContext`.
 
-Without migrations, Developer A and B would constantly break each other's local databases. With migrations, Developer A generates a migration file, commits it to Git, and Developer B just pulls the code and runs `Update-Database`. EF Core automatically applies Developer A's changes to Developer B's local database.
+Without migrations, their local PostgreSQL databases would immediately drift out of sync. With migrations, Engineer A commits a `Tenants` migration, Engineer B pulls `main`, runs `dotnet ef database update` (or Normora's `--migrate` host), and receives the exact schema change automatically.
 
-### 3. Safe Rolling Back (Undo)
-If you deploy a new feature to production and realize you made a massive mistake (e.g., a column data type is wrong and crashing the app), you can use migrations to safely "roll back" the database schema to the exact state it was in yesterday, without losing the data in the other tables.
+### 3. Repeatable Promotions Across Environments
+Every environment—Local Docker, CI Integration Tests, Staging, and Production—receives the exact same sequence of schema transitions, tracked in a dedicated history table (`__EFMigrationsHistory`).
+
+### 4. Controlled Rollbacks (When Reversible)
+If a newly deployed migration introduces a bad index or nullable constraint bug, you can target an earlier migration to run its `Down()` instructions and revert the schema change—provided the migration didn't permanently drop data (which is why **Zero-Downtime Expand-and-Contract**, covered in Section 6, is essential in production).
+
+### When NOT to Use EF Core Migrations
+Migrations are **not** always the right tool:
+*   **Ephemeral Automated Unit/Integration Tests:** For throwaway databases created per test class (e.g., SQLite in-memory or a fresh Testcontainers database where migration history isn't being tested), `Database.EnsureCreatedAsync()` is faster because it creates the schema directly from the current model in one step.
+*   **DBA-Owned Legacy Schemas:** If an external enterprise DBA team owns the database and forbids application-generated DDL (e.g., shared mainframe/ERP databases), use **Database-First scaffolding** (`dotnet ef dbcontext scaffold`) or read-only views rather than letting EF Core manage DDL.
+*   **Ad-Hoc Manual Production Hotfixes:** Never bypass migrations by running manual `ALTER TABLE` commands directly in `pgAdmin` on production—doing so causes **schema drift**, breaking future migrations.
 
 ---
 
 ## 3. Which Tools are Available for Migrations?
 
-To generate and apply migrations, you don't write the C# migration files yourself. You use command-line tooling provided by Microsoft. 
+To generate and apply migrations, you don't write the C# migration files yourself. You use command-line tooling provided by Microsoft.
 
-There are **two entirely different toolsets** you can use. They both do the exact same thing behind the scenes; the choice just depends on which IDE you are using.
+There are **two toolsets** you can use. They invoke the exact same EF Core design-time engine (`Microsoft.EntityFrameworkCore.Design`) under the hood; the choice depends on your IDE and automation workflow.
 
-### Option A: The .NET Core CLI (`dotnet ef`)
-This is the modern, cross-platform command-line tool. You use this if you are developing on a Mac, using Visual Studio Code (VS Code), using Rider, or running automated CI/CD pipelines (like GitHub Actions).
+### Option A: The .NET CLI (`dotnet ef`)
+This is the modern, cross-platform command-line tool. You use this in VS Code, JetBrains Rider, Linux/macOS terminals, and automated CI/CD pipelines (such as GitHub Actions).
 
-**Setup:** You must install it globally on your machine once:
+**Setup:** Install (or update to EF Core 10) globally once on your machine, and ensure your startup project (`Normora.Api`) references `Microsoft.EntityFrameworkCore.Design`:
 ```bash
-dotnet tool install --global dotnet-ef
+dotnet tool install --global dotnet-ef --version 10.*
+# Or update an existing installation:
+dotnet tool update --global dotnet-ef --version 10.*
 ```
 
-**The Commands (Terminal):**
-1. **Create a migration:** `dotnet ef migrations add AddedAgeToUser`
-2. **Apply to database:** `dotnet ef database update`
-3. **Remove the last migration (if unapplied):** `dotnet ef migrations remove`
-4. **Generate a raw SQL script for a DBA:** `dotnet ef migrations script`
+**Core CLI Commands:**
+1. **Create a migration:** `dotnet ef migrations add AddTenantPlanCurrency`
+2. **Apply pending migrations to local DB:** `dotnet ef database update`
+3. **Remove the last unapplied migration:** `dotnet ef migrations remove`
+4. **List all migrations & applied status:** `dotnet ef migrations list`
+5. **Check for un-migrated model drift (CI gate):** `dotnet ef migrations has-pending-model-changes`
+6. **Generate an idempotent SQL script:** `dotnet ef migrations script --idempotent --output migrate.sql`
 
-### Option B: The Package Manager Console (Visual Studio only)
-This is the classic PowerShell-based tool built directly into Visual Studio on Windows. If you are using full Visual Studio, this is usually the preferred and slightly faster method.
+### Option B: The Package Manager Console (Visual Studio on Windows)
+This PowerShell-based tool is built directly into full Visual Studio.
 
-**Setup:** You must install the `Microsoft.EntityFrameworkCore.Tools` NuGet package into your startup project.
+**Setup:** Install `Microsoft.EntityFrameworkCore.Tools` in your startup project.
 
-**The Commands (Package Manager Console):**
-1. **Create a migration:** `Add-Migration AddedAgeToUser`
+**Core PMC Commands:**
+1. **Create a migration:** `Add-Migration AddTenantPlanCurrency`
 2. **Apply to database:** `Update-Database`
 3. **Remove the last migration:** `Remove-Migration`
-4. **Generate a raw SQL script:** `Script-Migration`
+4. **Generate a raw SQL script:** `Script-Migration -Idempotent`
+
+### 5 Real-World Normora CLI Workflows
+Because Normora is a Modular Monolith with multiple `DbContext` classes (`TenantsDbContext`, `DocumentsDbContext`, `ConversationsDbContext`, and the Duende BFF session store), you always pass `--context` and `--output-dir`:
+
+1. **Add a Tenants schema migration:**
+   ```bash
+   dotnet ef migrations add AddTenantPlanCurrency \
+     --context TenantsDbContext \
+     --project server/Modules/Tenants \
+     --startup-project server/Normora.Api \
+     --output-dir Migrations
+   ```
+2. **Add a Documents pgvector index migration:**
+   ```bash
+   dotnet ef migrations add AddDocumentChunkHnswIndex \
+     --context DocumentsDbContext \
+     --project server/Modules/Documents \
+     --startup-project server/Normora.Api \
+     --output-dir Migrations
+   ```
+3. **Add a Conversations HITL approval table migration:**
+   ```bash
+   dotnet ef migrations add AddPendingApprovalTable \
+     --context ConversationsDbContext \
+     --project server/Modules/Conversations \
+     --startup-project server/Normora.Api \
+     --output-dir Migrations
+   ```
+4. **Verify no developer forgot a migration in CI (Model Drift Check):**
+   ```bash
+   dotnet ef migrations has-pending-model-changes \
+     --context DocumentsDbContext \
+     --project server/Modules/Documents \
+     --startup-project server/Normora.Api
+   ```
+5. **Inspect which `Conversations` migrations are pending against local PostgreSQL:**
+   ```bash
+   dotnet ef migrations list \
+     --context ConversationsDbContext \
+     --project server/Modules/Conversations \
+     --startup-project server/Normora.Api
+   ```
 
 ---
 
 ## 4. The Anatomy of a Migration File
 
-When you run `Add-Migration AddedAgeToUser`, EF Core generates a C# file with a timestamp in your project (e.g., `20231027_AddedAgeToUser.cs`). 
+When you run `dotnet ef migrations add ...`, EF Core creates or updates **three files** inside the target `--output-dir`:
 
-If you open it, you will see two very important methods: `Up()` and `Down()`.
+| Generated File | Purpose | Should You Edit Manually? |
+| :--- | :--- | :--- |
+| `<Timestamp>_<Name>.cs` | Contains `Up()` (apply change) and `Down()` (revert change) C# operations. | **Yes, when needed** (e.g., adding `migrationBuilder.Sql(...)` for data backfills or `CONCURRENTLY` indexes). |
+| `<Timestamp>_<Name>.Designer.cs` | Holds migration metadata (`[Migration("...")]`, `[DbContext(typeof(...))]`) and a copy of the model at that exact point in time (used for rollbacks and scripts). | **Never** — auto-managed by EF Core tooling. |
+| `<Context>ModelSnapshot.cs` | Represents the **current** cumulative C# model state across all migrations for that `DbContext`. | **Never** (except when resolving Git merge conflicts carefully—see Section 6). |
+
+Inside `<Timestamp>_AddTenantPlanCurrency.cs`, you will see `Up()` and `Down()`:
 
 ```csharp
-public partial class AddedAgeToUser : Migration
+public partial class AddTenantPlanCurrency : Migration
 {
-    // The Up() method runs when you are UPGRADING the database
+    // Runs when UPGRADING the PostgreSQL schema
     protected override void Up(MigrationBuilder migrationBuilder)
     {
-        migrationBuilder.AddColumn<int>(
-            name: "Age",
-            table: "Users",
-            type: "int",
-            nullable: true);
+        migrationBuilder.AddColumn<string>(
+            name: "Currency",
+            schema: "tenants",
+            table: "TenantPlans",
+            type: "character varying(3)",
+            maxLength: 3,
+            nullable: false,
+            defaultValue: "USD");
     }
 
-    // The Down() method runs when you are ROLLING BACK the database
+    // Runs when ROLLING BACK to the previous migration
     protected override void Down(MigrationBuilder migrationBuilder)
     {
         migrationBuilder.DropColumn(
-            name: "Age",
-            table: "Users");
+            name: "Currency",
+            schema: "tenants",
+            table: "TenantPlans");
     }
 }
 ```
 
 ### The `__EFMigrationsHistory` Table (Database Migration History)
-How does EF Core know which migrations have already been applied to your database? Does the database itself keep track of this history?
+How does EF Core know which migrations have already been applied to your database?
 
-**Yes, absolutely.** The database maintains its own history table to track which migrations have been executed. The very first time you apply a migration (`Update-Database` or `dotnet ef database update`), EF Core creates a special system table called **`__EFMigrationsHistory`**.
+The database maintains a system tracking table called **`__EFMigrationsHistory`**. The first time a migration runs for a `DbContext`, EF Core creates this table (if it does not already exist) in the configured schema.
 
 #### 1. What the Table Looks Like
-The physical structure of `__EFMigrationsHistory` is lightweight and consists of two columns:
+The physical structure of `__EFMigrationsHistory` is lightweight and has two columns:
 
-| Column Name | Data Type | Description | Example Value |
-| :--- | :--- | :--- | :--- |
-| **`MigrationId`** *(PK)* | `nvarchar(150)` | Timestamp prefix + Migration name | `20261011140000_AddedAgeToUser` |
-| **`ProductVersion`** | `nvarchar(32)` | The EF Core version used to apply the migration | `9.0.0` |
+| Column Name | PostgreSQL Type | SQL Server Type | Description | Example Value |
+| :--- | :--- | :--- | :--- | :--- |
+| **`MigrationId`** *(PK)* | `character varying(150)` | `nvarchar(150)` | UTC timestamp + Migration name | `20261011140000_AddTenantPlanCurrency` |
+| **`ProductVersion`** | `character varying(32)` | `nvarchar(32)` | EF Core version that generated/applied it | `10.0.0` |
 
-* `MigrationId` acts as the Primary Key. Because it starts with a UTC timestamp (e.g., `YYYYMMDDHHMMSS`), migrations are naturally sorted in chronological order.
+* `MigrationId` acts as the Primary Key. Because it begins with a UTC timestamp (`YYYYMMDDHHMMSS`), migrations sort naturally in chronological order.
 
 #### 2. How EF Core Uses This Table (The Sync Lifecycle)
-Whenever an update command or migration bundle runs, EF Core synchronizes your C# code against this database table:
+Whenever `dotnet ef database update`, `Database.MigrateAsync()`, or a Migration Bundle runs, EF Core synchronizes your compiled code against this table:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant App as EF Core CLI / Bundle
-    participant DB as SQL Server (__EFMigrationsHistory)
+    participant App as "EF Core CLI / Migrator"
+    participant DB as "PostgreSQL (__EFMigrationsHistory)"
 
-    App->>App: Scans compiled code for Migration .cs files
-    App->>DB: SELECT [MigrationId] FROM [__EFMigrationsHistory]
-    DB-->>App: Returns list of already applied migrations
-    App->>App: Computes difference (Pending = Code Migrations - Applied Migrations)
-    loop For each Pending Migration
-        App->>DB: Executes Migration Up() DDL (e.g. ALTER TABLE ...)
-        App->>DB: INSERT INTO [__EFMigrationsHistory] VALUES ('20261011140000_AddedAgeToUser', '9.0.0')
+    App->>App: "Scans compiled assembly for Migration classes"
+    App->>DB: "SELECT MigrationId FROM tenants.__EFMigrationsHistory"
+    DB-->>App: "Returns already-applied MigrationIds"
+    App->>App: "Computes Pending = Code Migrations - Applied"
+    loop "For each Pending Migration"
+        App->>DB: "Acquire migration lock & BEGIN TRANSACTION"
+        App->>DB: "Execute Up() DDL (e.g. ALTER TABLE tenants.TenantPlans ...)"
+        App->>DB: "INSERT INTO __EFMigrationsHistory ('20261011140000_AddTenantPlanCurrency', '10.0.0')"
+        App->>DB: "COMMIT"
     end
 ```
 
-1. **Scan Code:** EF Core inspects your compiled assembly to discover all migration classes inheriting from `Migration`.
-2. **Query Database:** It runs `SELECT [MigrationId] FROM [__EFMigrationsHistory]`.
-3. **Compute Diff:** Any migration present in your code that is **missing** from `__EFMigrationsHistory` is flagged as **pending**.
-4. **Apply & Record:** EF Core executes the pending migration's `Up()` SQL and immediately inserts a row into `__EFMigrationsHistory` inside the exact same database transaction. If the DDL fails, the insert is rolled back!
+1. **Scan Code:** EF Core inspects the compiled assembly to discover all classes inheriting from `Migration` that carry `[DbContext(typeof(TenantsDbContext))]`.
+2. **Query Database:** It reads existing `MigrationId` rows from the context's history table.
+3. **Compute Diff:** Any migration in compiled code that is **absent** from `__EFMigrationsHistory` is flagged as **pending**.
+4. **Lock, Apply & Record:** EF Core acquires a migration lock (Section 6), runs the migration's `Up()` SQL, and inserts a row into `__EFMigrationsHistory` inside the same database transaction (unless `suppressTransaction: true` is used). If the DDL fails, the transaction rolls back and the history table remains clean.
 
 #### 3. How Idempotent SQL Scripts Use It
-When generating SQL scripts for a DBA or automated CI/CD pipeline (`dotnet ef migrations script -i` or `Script-Migration -Idempotent`), EF Core wraps every migration block with a conditional check against this history table:
+When generating SQL scripts for a DBA or automated CI/CD pipeline (`dotnet ef migrations script --idempotent`), **idempotent** means *"safe to execute multiple times without changing the result beyond the first run."* EF Core wraps every migration block with a conditional check against `__EFMigrationsHistory` (shown here for PostgreSQL):
 
 ```sql
-IF NOT EXISTS (
-    SELECT * FROM [__EFMigrationsHistory] 
-    WHERE [MigrationId] = N'20261011140000_AddedAgeToUser'
-)
+DO $EF$
 BEGIN
-    -- 1. Apply DDL
-    ALTER TABLE [Users] ADD [Age] int NULL;
+    IF NOT EXISTS(
+        SELECT 1 FROM tenants."__EFMigrationsHistory"
+        WHERE "MigrationId" = '20261011140000_AddTenantPlanCurrency'
+    ) THEN
+        ALTER TABLE tenants."TenantPlans"
+            ADD "Currency" character varying(3) NOT NULL DEFAULT 'USD';
 
-    -- 2. Record migration in history table
-    INSERT INTO [__EFMigrationsHistory] ([MigrationId], [ProductVersion])
-    VALUES (N'20261011140000_AddedAgeToUser', N'9.0.0');
-END;
+        INSERT INTO tenants."__EFMigrationsHistory" ("MigrationId", "ProductVersion")
+        VALUES ('20261011140000_AddTenantPlanCurrency', '10.0.0');
+    END IF;
+END $EF$;
 ```
 
-This ensures the script is completely safe to run against any database environment—if a migration has already been executed, SQL Server simply skips it.
+Now the script is completely safe to run against any environment—if a migration has already been executed, PostgreSQL skips it cleanly.
 
 #### 4. Customizing the History Table (Modular Monoliths & Custom Schemas)
-By default, the table is named `dbo.__EFMigrationsHistory`. If you are building a Modular Monolith or microservices architecture where multiple `DbContext` instances share one database, you must isolate their migration tracking to avoid collisions:
+By default, EF Core creates `__EFMigrationsHistory` in the default schema (`public` in PostgreSQL, `dbo` in SQL Server). In a Modular Monolith where **multiple `DbContext` instances share one PostgreSQL database**, leaving all of them on the default `__EFMigrationsHistory` table mixes their histories or causes schema ownership collisions.
+
+In Normora, each module isolates its tables **and** its migration history table into its own PostgreSQL schema (`tenants`, `documents`, `conversations`):
 
 ```csharp
-builder.Services.AddDbContext<BillingDbContext>(options =>
-    options.UseSqlServer(connectionString, sql =>
-        sql.MigrationsHistoryTable("__EFMigrationsHistory_Billing", "billing")));
+// Example: Isolating Normora's module history tables per PostgreSQL schema
+services.AddDbContext<TenantsDbContext>(options =>
+    options.UseNpgsql(connectionString, npgsql =>
+        npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "tenants")));
+
+services.AddDbContext<DocumentsDbContext>(options =>
+    options.UseNpgsql(connectionString, npgsql =>
+    {
+        npgsql.UseVector(); // Enables pgvector column & HNSW operator support
+        npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "documents");
+    }));
+
+services.AddDbContext<ConversationsDbContext>(options =>
+    options.UseNpgsql(connectionString, npgsql =>
+        npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "conversations")));
 ```
 
+### 5 Real-World Normora Migration Anatomy Examples
+1. **`TenantsDbContext` (`tenants.__EFMigrationsHistory`):** Adding `TenantPlan.Currency` (`character varying(3)`) and `TenantPlan.BillingCycle` (`Monthly`/`Annual`) while preserving existing tenant rows with default `'USD'`.
+2. **`DocumentsDbContext` (`documents.__EFMigrationsHistory`):** Enabling `pgvector` via `migrationBuilder.AlterDatabase().Annotation("Npgsql:PostgresExtension:vector", ",,")` and creating the `vector(768)` embedding column on `DocumentChunks`.
+3. **`DocumentsDbContext` (`documents.__EFMigrationsHistory`):** Adding `DocumentProcessingOutboxMessages` with an index on `(Status, NextRetryAt)` so Hangfire's `HangfireDocumentProcessingOutboxDispatcher` claims pending uploads efficiently.
+4. **`ConversationsDbContext` (`conversations.__EFMigrationsHistory`):** Creating `PendingApprovals` with `ExpiresAt` and `ToolCallPayload` (`jsonb`) for two-phase HITL tool confirmation.
+5. **BFF Session Store (`public` or `bff` schema):** Tracking Duende BFF `PersistedGrants` / server-side user session schema separately via `SessionDatabaseMigrator` so auth session upgrades never collide with module migrations.
+
 #### 5. Industry Standard Across Tools
-Tracking migrations directly within a dedicated database table is not unique to EF Core—it is the universal design pattern across all enterprise database migration tools:
+Tracking applied migrations in a dedicated database table is universal across migration engines:
 * **EF Core (.NET):** `__EFMigrationsHistory`
 * **DbUp (.NET):** `SchemaVersions`
 * **Flyway (Java / Polyglot):** `flyway_schema_history`
@@ -180,66 +276,128 @@ Tracking migrations directly within a dedicated database table is not unique to 
 
 ## 5. Types of Migrations in Enterprise Applications
 
-When developers talk about "Types of Migrations," they are referring to different strategies for generating and applying schema changes. Here are the 4 main types you will encounter:
+When engineers talk about "Types of Migrations," they refer to different strategies for generating and applying schema or data changes. Here are the 5 core migration patterns you will encounter in EF Core 10:
 
 ### 1. Code-First Migrations (Schema Migrations)
-This is the absolute standard and most common type of migration in EF Core.
-*   **What it is:** You write your C# domain models and configure your Fluent API first. Then you run `Add-Migration`, and EF Core generates the `Up()` and `Down()` methods to create the SQL tables.
-*   **Use Case:** Adding new features. For example, adding a `StripeCustomerId` property to the `Tenant` class and generating a migration to add that column to the database.
+This is the standard and most common type of migration in EF Core.
+*   **What it is:** You modify your C# domain entities and `IEntityTypeConfiguration<T>` classes first, then run `dotnet ef migrations add ...`. EF Core generates the `Up()` and `Down()` methods automatically.
+*   **Use Case:** Adding new features—such as adding `Currency` and `BillingCycle` to `TenantPlan` in `TenantsDbContext`, or adding `IsPinned` to `SavedAnswer` in `ConversationsDbContext`.
 
-### 2. Empty Migrations (For Raw SQL, Views, and Stored Procedures)
-EF Core is amazing at generating tables and columns, but it **cannot** auto-generate SQL Views, Stored Procedures, Triggers, or complex SQL Functions from C# code. 
-*   **What it is:** You run `Add-Migration CreateUserReportView` *without actually changing any C# code*. EF Core generates a completely blank migration file.
-*   **Use Case:** You open the blank file and manually write raw SQL inside the `Up()` method using `migrationBuilder.Sql()`. 
+### 2. Empty Migrations & Non-Transactional DDL (`suppressTransaction: true`)
+EF Core generates tables, columns, and standard B-tree indexes, but it cannot express every database-native construct via Fluent API—such as PostgreSQL triggers, custom full-text search `tsvector` expressions, materialized views, or **concurrent index builds**.
+*   **What it is:** Run `dotnet ef migrations add AddChunkFtsIndex` *without changing any C# entity*. EF Core scaffolds an empty `Up()` and `Down()` where you place `migrationBuilder.Sql(...)`.
+*   **PostgreSQL `suppressTransaction: true`:** By default, EF Core wraps each migration in a transaction. However, PostgreSQL **forbids** running `CREATE INDEX CONCURRENTLY` (which builds indexes without locking table writes!) inside a transaction block. You must pass `suppressTransaction: true`:
+
 ```csharp
 protected override void Up(MigrationBuilder migrationBuilder)
 {
-    // Manually writing a SQL View in an empty migration!
-    migrationBuilder.Sql(@"
-        CREATE VIEW ActiveUsersView AS 
-        SELECT Id, Name FROM Users WHERE IsActive = 1
-    ");
+    // Non-blocking production index on Normora's DocumentChunks table
+    migrationBuilder.Sql(
+        """
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_document_chunks_content_fts
+        ON documents."DocumentChunks" USING GIN (to_tsvector('english', "Content"));
+        """,
+        suppressTransaction: true);
+}
+
+protected override void Down(MigrationBuilder migrationBuilder)
+{
+    migrationBuilder.Sql(
+        """
+        DROP INDEX CONCURRENTLY IF EXISTS documents.ix_document_chunks_content_fts;
+        """,
+        suppressTransaction: true);
 }
 ```
+*   **When NOT to use `suppressTransaction: true`:** Do not mix multiple schema changes in the same migration with `suppressTransaction: true`. If step 2 fails after step 1 succeeds outside a transaction, PostgreSQL cannot roll back step 1 automatically, leaving the migration half-applied. Isolate `CONCURRENTLY` index statements into their own dedicated migration!
 
 ### 3. Data Migrations (Preventing Data Loss During Refactoring)
-The golden rule of migrations is to **never lose production data**. However, if you do a "destructive" refactor (like renaming a column, or splitting `FullName` into `FirstName` and `LastName`), EF Core will generate a migration that drops the old column. 
-
-When you run `Add-Migration` for a destructive change, EF Core will print a bright yellow warning in your terminal:
+The golden rule of production migrations is **never lose customer data**. Whenever a refactor renames, splits, or transforms columns (for example, migrating Normora's legacy `KeycloakUserId` column to vendor-neutral `ExternalUserId`, or backfilling `TenantPlan.Currency`), EF Core warns you if a scaffolded `DropColumn` may lose data:
 > ⚠️ **WARNING: An operation was scaffolded that may result in the loss of data. Please review the migration for accuracy.**
 
-If you just run `Update-Database`, you will lose all the users' names! To prevent data loss, you must manually intervene and add a **Data Migration** step *before* the column is dropped:
+Instead of letting `DropColumn` destroy existing values, inject a SQL backfill step between adding the new column and dropping the old one:
 
-1. You create a Code-First migration to add the new `FirstName` and `LastName` columns.
-2. Before EF Core drops the old column, you manually add a SQL step in the `Up()` method to safely move the data:
 ```csharp
 protected override void Up(MigrationBuilder migrationBuilder)
 {
-    // 1. EF Core auto-generates adding the new columns (Safe)
-    migrationBuilder.AddColumn<string>(name: "FirstName", table: "Users", ...);
-    migrationBuilder.AddColumn<string>(name: "LastName", table: "Users", ...);
+    // 1. Add the new vendor-neutral column (nullable initially)
+    migrationBuilder.AddColumn<string>(
+        name: "ExternalUserId",
+        schema: "tenants",
+        table: "TenantMemberships",
+        type: "character varying(128)",
+        nullable: true);
 
-    // 2. YOU MANUALLY INTERVENE: Write SQL to move the data safely!
-    migrationBuilder.Sql(@"
-        UPDATE Users 
-        SET FirstName = SUBSTRING(FullName, 1, CHARINDEX(' ', FullName) - 1),
-            LastName = SUBSTRING(FullName, CHARINDEX(' ', FullName) + 1, LEN(FullName))
-        WHERE FullName IS NOT NULL
-    ");
+    // 2. Backfill existing rows safely in PostgreSQL
+    migrationBuilder.Sql("""
+        UPDATE tenants."TenantMemberships"
+        SET "ExternalUserId" = "KeycloakUserId"
+        WHERE "ExternalUserId" IS NULL;
+        """);
 
-    // 3. EF Core auto-generates dropping the old column. 
-    // Now it is safe to drop, because we saved the data in step 2!
-    migrationBuilder.DropColumn(name: "FullName", table: "Users");
+    // 3. Enforce NOT NULL once all rows are populated
+    migrationBuilder.AlterColumn<string>(
+        name: "ExternalUserId",
+        schema: "tenants",
+        table: "TenantMemberships",
+        type: "character varying(128)",
+        nullable: false,
+        oldClrType: typeof(string),
+        oldNullable: true);
+
+    // 4. Only drop the legacy column in a later contract migration (see Section 6)
+    migrationBuilder.DropColumn(
+        name: "KeycloakUserId",
+        schema: "tenants",
+        table: "TenantMemberships");
 }
 ```
 
-### 4. Database-First Migrations (Reverse Engineering / Scaffolding)
-This is the exact opposite of Code-First.
-*   **What it is:** You don't write any C# code. You already have a massive, pre-existing SQL Server database (perhaps built 10 years ago by a DBA). You use the EF Core CLI command `dotnet ef dbcontext scaffold` to connect to the database.
-*   **Use Case:** EF Core reads the SQL Server schema and automatically generates all the C# entity classes and the `DbContext` for you. Once scaffolded, you can switch back to Code-First for future updates.
+### 4. Data Seeding Migrations (`HasData` vs. EF Core 10 `UseSeeding` / `UseAsyncSeeding`)
+There are two distinct mechanisms for seeding reference/initial data in EF Core 10:
 
-### Bonus: "Squashed" Migrations
-Over 5 years, your enterprise app might accumulate 300 migration files. This slows down build times and clutters the project. "Squashing" is the process of deleting all 300 migration files and generating a single, massive "InitialCreate" migration that represents the entire current state of the database in one file, allowing you to start fresh.
+| Approach | How It Works | Best For | When NOT to Use |
+| :--- | :--- | :--- | :--- |
+| **`HasData(...)`** (inside `IEntityTypeConfiguration<T>`) | Generates `migrationBuilder.InsertData(...)` / `UpdateData(...)` inside migration `.cs` files. | Static, immutable lookup tables with hardcoded PKs (e.g., system plan tiers). | **Never** use `Guid.NewGuid()` or `DateTime.UtcNow` inside `HasData`, or EF Core 10 throws `PendingModelChangesWarning`! Not suited for large datasets or runtime DB lookups. |
+| **`UseSeeding` / `UseAsyncSeeding`** *(EF Core 9 & 10)* | Configured on `DbContextOptionsBuilder`. Executes automatically inside `Migrate()` / `EnsureCreated()` / `dotnet ef database update` under the migration lock. | Dynamic, idempotent startup seeding (e.g., seeding a default Normora demo workspace, checking if an admin role exists first). | Not embedded in `dotnet ef migrations script` SQL output (runs in C# runtime, not pure SQL). |
+
+```csharp
+// EF Core 10 recommended runtime seeding in Normora's DatabaseServiceExtensions:
+services.AddDbContext<TenantsDbContext>(options =>
+    options.UseNpgsql(connectionString, npgsql =>
+            npgsql.MigrationsHistoryTable("__EFMigrationsHistory", "tenants"))
+        .UseSeeding((context, _) =>
+        {
+            if (!context.Set<Tenant>().Any(t => t.Slug == "default"))
+            {
+                context.Set<Tenant>().Add(Tenant.CreateSystemDefault("default", "Normora Demo"));
+                context.SaveChanges();
+            }
+        })
+        .UseAsyncSeeding(async (context, _, ct) =>
+        {
+            if (!await context.Set<Tenant>().AnyAsync(t => t.Slug == "default", ct))
+            {
+                context.Set<Tenant>().Add(Tenant.CreateSystemDefault("default", "Normora Demo"));
+                await context.SaveChangesAsync(ct);
+            }
+        }));
+```
+*(Implement **both** `UseSeeding` and `UseAsyncSeeding` with identical logic because CLI tools and certain synchronous paths invoke `UseSeeding`, while `MigrateAsync()` invokes `UseAsyncSeeding`.)*
+
+### 5. Database-First Migrations (Reverse Engineering / Scaffolding)
+When connecting EF Core to an existing database created outside EF Core (e.g., a legacy reporting database managed by DBAs), run `dotnet ef dbcontext scaffold` to inspect the live tables and generate C# entities and a `DbContext`. Once scaffolded, teams typically either keep it read-only or establish an initial baseline migration and adopt Code-First going forward.
+
+### Bonus: "Squashed" Migrations (With Production Safety)
+Over several years, a module might accumulate 200+ migration files, slowing down build times and cluttering `Migrations/`. **Squashing** collapses old migrations into a single `InitialBaseline` migration.
+*   **Critical Production Catch:** You **cannot** simply delete old migration files and run a new `InitialBaseline` migration against an existing production database—PostgreSQL would fail trying to `CREATE TABLE` on tables that already exist! To squash safely in production, you must either keep a pre-squash marker or manually insert the new baseline `MigrationId` into `__EFMigrationsHistory` (and delete old rows) once all environments have passed the squash checkpoint.
+
+### 5 Real-World Normora Examples Across Migration Types
+1. **Code-First (`TenantsDbContext`):** Adding `TenantPlan.Currency` (`USD`, `INR`, `EUR`, `GBP`) and `TenantPlan.BillingCycle` columns via `AddTenantPlanCurrency`.
+2. **Empty + `suppressTransaction: true` (`DocumentsDbContext`):** Creating a non-blocking `CREATE INDEX CONCURRENTLY` GIN full-text index and HNSW `vector_cosine_ops` index on `documents."DocumentChunks"` so hybrid RRF search runs without locking document uploads.
+3. **Data Migration (`TenantsDbContext`):** Backfilling `tenants."TenantMemberships"."ExternalUserId"` from legacy `KeycloakUserId` rows before removing the vendor-specific column.
+4. **EF Core 10 `UseAsyncSeeding` (`TenantsDbContext`):** Idempotently seeding the local development workspace (`Slug = "acme-corp"`) and pre-seeded test memberships during `dotnet Normora.Api.dll --migrate`.
+5. **Empty Migration (`ConversationsDbContext`):** Creating a PostgreSQL partial index (`WHERE "Status" = 'Pending'`) on `conversations."PendingApprovals"` so active HITL expiration sweeps stay sub-millisecond.
 
 ---
 
