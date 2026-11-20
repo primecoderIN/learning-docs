@@ -2,52 +2,176 @@
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
-- Understand the internal structure of a `Delegate` and `MulticastDelegate`.
-- Identify and resolve memory leaks caused by C# `event` subscriptions.
-- Analyze the Roslyn-generated state machines behind `IEnumerable` and `yield return`.
-- Optimize LINQ queries by understanding Deferred Execution vs. Materialization.
+- Understand the internal structure of `Delegate` and `MulticastDelegate` (`_target`, `_methodPtr`, `_invocationList`), delegate variance, immutability, and C# 14 lambda improvements.
+- Identify and resolve memory leaks caused by C# `event` subscriptions, implement thread-safe and fault-isolated event dispatch, and know when to choose Transactional Outboxes or SignalR/MediatR over in-process events.
+- Analyze the Roslyn-generated state machines behind `IEnumerable<T>`, `yield return`, `try/finally` disposal, eager argument validation, and `IAsyncEnumerable<T>` streaming.
+- Distinguish `IEnumerable<T>` (LINQ to Objects) from `IQueryable<T>` (Expression Tree ASTs compiled to SQL by EF Core) and enforce clean module boundaries.
+- Optimize LINQ queries in .NET 10 and C# 14 using Deferred Execution vs. Materialization, zero-allocation `static` lambdas, `TryGetNonEnumeratedCount`, `CountBy`/`AggregateBy`/`LeftJoin`, and C# 14 extension members—and recognize when to avoid LINQ entirely.
 
 ## 2. Introduction
 
 One of the most powerful features of C# is its ability to treat functions as first-class citizens. You can assign a method to a variable, pass it as a parameter, and execute it asynchronously. This is the foundation of event-driven programming, callbacks, and Language Integrated Query (LINQ).
 
-However, delegates and LINQ are heavily abstracted by the compiler. A simple lambda expression `x => x > 5` or a LINQ `.Where()` clause hides significant memory allocations and complex state machines. To write high-performance enterprise applications, you must understand exactly what the compiler is doing behind the scenes.
+However, delegates and LINQ are heavily abstracted by the compiler. A simple lambda expression `x => x > 5` or a LINQ `.Where()` clause hides heap allocations, closure capture classes, expression tree Abstract Syntax Trees (ASTs), and complex compiler-generated state machines. To architect high-performance, multi-tenant .NET 10 systems like **Normora** (with strict tenant isolation, EF Core + pgvector queries, and real-time RAG streaming), you must understand both the exact mechanics under the hood and when *not* to use these abstractions.
 
 ## 3. Anatomy of a Delegate
 
-In C/C++, you can pass a "function pointer" to another method. It is simply a memory address. It is fast, but it is not type-safe, and it has no concept of object state.
+In C/C++, you can pass a "function pointer" to another method. It is simply a raw memory address. It is fast, but it is not type-safe, and it has no concept of object state.
 
-In C#, a **Delegate** is an object-oriented, type-safe wrapper around a function pointer.
+In C#, a **Delegate** is an object-oriented, type-safe wrapper around a method reference (or a chain of method references). It defines a strict contract: parameter types and return type.
 
 When you declare a delegate:
 ```csharp
 public delegate void TelemetryReceivedHandler(string chargerId, decimal voltage);
 ```
 
-The Roslyn compiler actually generates a completely new class that inherits from `System.MulticastDelegate`.
+The Roslyn compiler actually generates a completely new `sealed` class that inherits from `System.MulticastDelegate` (which itself inherits from `System.Delegate`), exposing `Invoke`, `BeginInvoke`, and `EndInvoke` methods matching your signature.
 
-### Inside `MulticastDelegate`
-An instance of a delegate holds two critical pieces of information:
-1. `MethodPtr`: A pointer to the JIT-compiled native code of the method to execute.
-2. `Target`: A reference to the object instance on which the method should be invoked (if it is an instance method). If the method is `static`, `Target` is null.
+### 3.1 Inside `MulticastDelegate` and the GC Root Chain
+An instance of a delegate holds three critical internal fields (inherited from `System.Delegate` and `System.MulticastDelegate`):
+1. `_methodPtr` (`IntPtr`): A pointer to the JIT-compiled (Just-In-Time compiled) native machine code of the method to execute.
+2. `_target` (`object?`): A reference to the object instance on which the method should be invoked (if it is an instance method). If the target method is `static`, `_target` is `null` (or points to the delegate itself for certain static/open dispatch stubs).
+3. `_invocationList` (`object?`): When multiple delegates are combined with `+` or `+=`, `MulticastDelegate` stores an array of delegates (`object[]`) representing the chained invocation pipeline.
 
-Because it holds a `Target` reference, **a delegate acts as a GC Root for the object it points to.** This is the source of many memory leaks in .NET.
+Because `_target` holds a strong reference to an object instance, **a delegate acts as a GC Root (a reference the Garbage Collector treats as live) for every subscriber instance it points to.** This is the primary source of delegate-related memory leaks in .NET.
 
-### Action and Func
-To avoid declaring custom delegates for every signature, .NET provides generic, built-in delegates:
-- `Action<T1, T2...>`: Represents a method that returns `void`.
-- `Func<T1, T2..., TResult>`: Represents a method that returns a value of type `TResult`.
+```mermaid
+flowchart LR
+    D["MulticastDelegate Instance"] --> MP["_methodPtr (JIT Native Code)"]
+    D --> TG["_target (Strong GC Reference to Subscriber)"]
+    D --> IL["_invocationList (Array of Chained Delegates)"]
+    IL --> D1["Delegate 1: TenantAuditHandler"]
+    IL --> D2["Delegate 2: MetricsCollectorHandler"]
+    TG -.->|"Prevents Garbage Collection"| SUB["Subscriber Object Instance"]
+```
+
+### 3.2 Built-in Delegates, Natural Types, and C# 14 Lambdas
+To avoid declaring custom `delegate` types for every signature, .NET provides generic, built-in delegates in `System`:
+- `Action` / `Action<T1, ..., T16>`: Represents a method returning `void`.
+- `Func<T1, ..., T16, TResult>`: Represents a method returning a value of type `TResult`.
+- `Predicate<T>`: Equivalent to `Func<T, bool>`, used by `List<T>.FindAll` and `Array.FindAll`. (LINQ uses `Func<T, bool>` instead.)
+- `Comparison<T>`: Equivalent to `Func<T, T, int>`, used by `List<T>.Sort` and `Array.Sort`.
+- `Converter<TInput, TOutput>`: Equivalent to `Func<TInput, TOutput>`, used by `List<T>.ConvertAll`.
+
+**Modern C# Lambda & Method Group Enhancements:**
+- **Static Lambdas (C# 9+):** Prefixing a lambda with `static` (e.g., `static x => x.IsActive`) instructs Roslyn to forbid capturing local variables or `this`. The compiler caches the delegate once for the lifetime of the AppDomain—**zero heap allocations per call**.
+- **Natural Delegate Types (C# 10+):** You can assign lambdas directly to `var` (`var isAdmin = (string role) => role == "Admin";`), letting the compiler infer `Func<string, bool>`.
+- **Method Group Caching (C# 11+):** Converting a static or instance method group (e.g., `chunks.Select(NormalizeChunk)`) previously allocated a new delegate object on every call in older C# versions. Since C# 11, Roslyn emits a cached static field for static method groups, eliminating hidden per-call delegate allocations.
+- **Default Lambda Parameters (C# 12+):** Lambdas support optional parameters (`var formatPage = (int page, int size = 20) => ...`).
+- **Simple Lambda Parameters with Modifiers (C# 14):** Prior to C# 14, adding parameter modifiers (`ref`, `in`, `out`, `scoped`, `ref readonly`) forced you to spell out every parameter type. C# 14 lets you write `(ref chunk) => ...` or `(scoped ReadOnlySpan<char> text) => ...` cleanly when the delegate type provides the parameter types.
+
+### 3.3 Immutability, Fault Isolation, and Variance (`in` / `out`)
+- **Delegates are Immutable:** Just like `System.String`, calling `Delegate.Combine` (`+=`) or `Delegate.Remove` (`-=`) does **not** mutate an existing delegate. It allocates a brand-new `MulticastDelegate` instance with a copied `_invocationList`. That immutability is why copying a delegate reference into a local variable before invoking it is thread-safe.
+- **Fault Isolation via `GetInvocationList()`:** By default, invoking a multicast delegate (`pipeline?.Invoke(ctx)`) runs subscribers sequentially. If Subscriber 1 throws an exception, Subscribers 2 and 3 **never run**. In production pipelines, iterate `GetInvocationList()` inside a `try/catch` loop so one failing hook does not drop downstream telemetry or audit handlers.
+- **Covariance (`out`) and Contravariance (`in`):**
+  - **Covariance (`out TResult`):** A `Func<Derived>` can be assigned to a `Func<Base>` because the caller only reads a `Base`.
+  - **Contravariance (`in T`):** An `Action<Base>` can be assigned to an `Action<Derived>` because a handler expecting `Base` can safely accept any `Derived`.
+  - *(Note: Delegate variance only applies to reference types, not value types like `int` or `Guid`, because boxing changes binary layout.)*
+
+### 3.4 When to Use vs. When NOT to Use Delegates
+- **Use delegates when:** You need a lightweight strategy/callback (such as a scoring policy, validation predicate, or middleware step), or when composing functional transformations (`Func<T, TResult>`).
+- **Do NOT use delegates when:**
+  - **You have a multi-method contract or DI lifecycle:** Prefer an explicit interface (e.g., `ITextEmbeddingService` in `Normora.Modules.Documents`) so dependencies are mockable, discoverable, and constructor-injected via primary constructors.
+  - **You are in an extreme zero-allocation hot loop:** Every delegate invocation goes through an indirect call stub (`_methodPtr`) and cannot normally be inlined by the JIT. In ultra-hot paths (e.g., parsing raw byte frames or SIMD vector math), prefer `static` methods, `struct` comparers (`IComparer<T>`), or C# `delegate*<...>` unmanaged/managed function pointers in `unsafe` code.
+
+### 3.5 Normora in Action: 5 Real-World Delegate Examples
+
+1. **Custom Domain Delegate for Audit Log Redaction (`Tenants` Module)**
+   Defining a named delegate makes domain intent self-documenting when redacting sensitive payload fields before writing `AuditLogs`:
+   ```csharp
+   public delegate string AuditPayloadRedactor(string actionName, string rawJson);
+
+   public sealed class AuditSanitizer
+   {
+       public static string RedactSensitiveFields(string actionName, string rawJson) =>
+           actionName == "InviteEmployee" ? "[REDACTED_INVITE_PAYLOAD]" : rawJson;
+   }
+
+   // C# 11+ caches the static method group conversion automatically
+   AuditPayloadRedactor redactor = AuditSanitizer.RedactSensitiveFields;
+   ```
+
+2. **Built-in `Func` and `Action` in Document Chunking (`Documents` Module)**
+   `DocumentChunker` tracks Markdown heading breadcrumbs (`#`, `##`, `###`). Passing a `Func<string, string>` strategy decouples breadcrumb formatting from chunk splitting:
+   ```csharp
+   public static IEnumerable<string> BuildChunkHeaders(
+       IEnumerable<string> headings,
+       Func<string, string> formatBreadcrumb)
+   {
+       foreach (var heading in headings)
+       {
+           yield return formatBreadcrumb(heading);
+       }
+   }
+
+   // Zero-allocation static lambda (forbids capturing local state)
+   var headers = BuildChunkHeaders(
+       ["Policy", "Travel", "Hotel Limits"],
+       static h => h.Trim().ToUpperInvariant());
+   ```
+
+3. **Fault-Isolated Multicast Dispatch with `GetInvocationList()`**
+   If multiple in-process diagnostics hooks listen after a document upload commits, a failing metrics hook must never prevent downstream logging:
+   ```csharp
+   public static void NotifyIngestionHooks(Action<Guid>? hooks, Guid documentId)
+   {
+       if (hooks is null) return;
+
+       foreach (Action<Guid> singleHook in hooks.GetInvocationList())
+       {
+           try
+           {
+               singleHook(documentId);
+           }
+           catch (Exception ex)
+           {
+               // Log structured error; never leak internal traces to users (CWE-209)
+               Console.Error.WriteLine($"Hook failed for document {documentId}: {ex.GetType().Name}");
+           }
+       }
+   }
+   ```
+
+4. **Delegate Contravariance (`in`) & Covariance (`out`) Across Module Contracts**
+   In Normora, handlers operating on base domain abstractions can seamlessly subscribe where derived types are emitted:
+   ```csharp
+   public record KnowledgeResource(Guid Id, Guid TenantId);
+   public sealed record DocumentAsset(Guid Id, Guid TenantId, string FileName) : KnowledgeResource(Id, TenantId);
+
+   // Contravariance: Action<KnowledgeResource> is assignable to Action<DocumentAsset>
+   Action<KnowledgeResource> auditResource = static r =>
+       Console.WriteLine($"Auditing resource {r.Id} for tenant {r.TenantId}");
+   Action<DocumentAsset> auditDocument = auditResource;
+
+   // Covariance: Func<DocumentAsset> is assignable to Func<KnowledgeResource>
+   Func<DocumentAsset> loadDoc = static () => new(Guid.NewGuid(), Guid.NewGuid(), "handbook.pdf");
+   Func<KnowledgeResource> loadResource = loadDoc;
+   ```
+
+5. **C# 14 Lambda Parameter Modifiers Without Explicit Types**
+   When mutating a `ref` struct or token counter inside a delegate signature, C# 14 allows omitting redundant parameter types while keeping `ref`:
+   ```csharp
+   public delegate void TokenAccumulator(ref int remainingTokens, int chunkTokens);
+
+   // C# 14: 'ref' modifier without repeating 'int'
+   TokenAccumulator deductTokens = static (ref budget, cost) =>
+   {
+       budget = Math.Max(0, budget - cost);
+   };
+   ```
 
 ## 4. Events and Memory Leaks
 
-An `event` in C# is a syntactic wrapper over a `MulticastDelegate`. A `MulticastDelegate` maintains a linked list of delegates (an invocation list). When you trigger the event, the runtime iterates through the list, calling each method sequentially.
+An `event` in C# is a **publisher-subscriber encapsulation layer** over a `MulticastDelegate`. A `MulticastDelegate` maintains an invocation list of delegates. When you trigger the event, the runtime iterates through the list, calling each method sequentially.
+
+Why not just expose a `public Action<string>?` field directly? Because a raw public delegate field lets *any* external class overwrite all other subscribers (`publisher.OnEvent = null;`) or forge an invocation (`publisher.OnEvent("fake")`). Declaring `event` restricts external callers strictly to `+=` (subscribe) and `-=` (unsubscribe). Only the declaring class can invoke or clear the delegate.
 
 ```csharp
 public class EvNetwork
 {
-    // The compiler generates a private MulticastDelegate field, 
-    // and public add/remove methods.
-    public event Action<string> OnChargerDisconnected;
+    // The compiler generates a private MulticastDelegate field,
+    // and public thread-safe add/remove methods using Interlocked.CompareExchange.
+    public event Action<string>? OnChargerDisconnected;
 
     public void TriggerDisconnect(string id)
     {
@@ -56,7 +180,12 @@ public class EvNetwork
 }
 ```
 
-### The Event Memory Leak
+### 4.1 `EventHandler<TEventArgs>` and Custom `add`/`remove` Accessors
+In .NET APIs, the standard convention uses `EventHandler<TEventArgs>` (passing `object? sender` and an immutable `EventArgs` subclass) so subscribers know which publisher instance raised the notification without creating closure captures.
+
+Under the hood, Roslyn compiles a field-like event into a private delegate field plus lock-free `add` and `remove` methods using `Interlocked.CompareExchange` (Compare-And-Swap) so concurrent subscriptions from multiple threads never lose updates. You can also write custom `add` / `remove` accessors—for example, to store subscribers in an `EventHandlerList` (used in UI frameworks with dozens of rare events to avoid allocating 20 null delegate fields per instance) or a weak-reference registry.
+
+### 4.2 The Event Memory Leak
 Consider this scenario: A long-lived singleton `EvNetwork` exposes an event. A short-lived `DashboardUI` subscribes to it.
 
 ```csharp
@@ -72,11 +201,133 @@ public class DashboardUI
 }
 ```
 
-When the user closes the Dashboard, the `DashboardUI` object should be garbage collected. **It will not be.** 
+When the user closes the Dashboard, the `DashboardUI` object should be garbage collected. **It will not be.**
 
-Because `EvNetwork` (a singleton) holds a `MulticastDelegate`, and that delegate holds the `Target` reference to `DashboardUI`, the GC considers `DashboardUI` to be alive. The UI is leaked. If the user opens and closes the dashboard 100 times, 100 UI objects remain in memory forever.
+Because `EvNetwork` (a singleton) holds a `MulticastDelegate`, and that delegate holds the `_target` reference to `DashboardUI`, the GC considers `DashboardUI` to be alive. The UI is leaked. If the user opens and closes the dashboard 100 times, 100 UI objects remain in memory forever.
 
-**The Fix:** Always unsubscribe (`-=`) when an object is disposed, or use the Weak Event Pattern (using `WeakReference`).
+```mermaid
+sequenceDiagram
+    participant S as "Singleton Publisher (Lifetime: App)"
+    participant D as "Scoped Subscriber (Lifetime: 1 Request)"
+    participant GC as "Garbage Collector"
+
+    D->>S: "Subscribe (+= OnChanged)"
+    Note over S,D: "S._invocationList holds _target -> D"
+    D--xGC: "Request ends (D goes out of scope)"
+    GC-->>S: "Traces GC Roots from Singleton S"
+    Note over S,GC: "D is still reachable via S._target -> MEMORY LEAK"
+    D->>S: "Fix: Dispose() calls (-= OnChanged)"
+    GC-->>D: "D is unreachable -> Safely Collected"
+```
+
+**The Fix:** Always unsubscribe (`-=`) when an object is disposed (`IDisposable`), or use the Weak Event Pattern (using `WeakReference<T>` or `ConditionalWeakTable`).
+
+### 4.3 Thread-Safe Invocation and Exception Isolation
+Because delegates are immutable, evaluating `OnChanged?.Invoke(...)` compiles to:
+1. Copy the backing delegate field to a local variable (`var handler = OnChanged;`).
+2. Check `if (handler != null) handler.Invoke(...);`.
+
+Copying to a local prevents a classic race condition where Thread B unsubscribes the last handler *between* Thread A's `null` check and `.Invoke()`. However, if you have multiple independent subscribers and one might throw, iterate `handler.GetInvocationList()` with individual `try/catch` blocks.
+
+### 4.4 When NOT to Use C# Events
+As a senior architect, avoid C# `event` keywords in the following scenarios:
+- **Across Process Boundaries (`Normora.Worker` ↔ `Normora.Api`):** C# events only exist inside a single .NET process's RAM. In Normora, background ingestion runs in `Normora.Worker`, while WebSocket clients connect to `Normora.Api`. Raising a C# event in the worker will never reach browser clients. Use **Transactional Outbox** (`DocumentProcessingOutboxMessage`) plus a **Redis SignalR backplane** (`IDocumentNotificationService` / `INotificationService`).
+- **Async Domain Workflows & Cross-Module Communication:** C# events are synchronous and return `void` (forcing `async void` subscribers if awaited, which crash the process on unhandled exceptions). Inside Normora's modular monolith, cross-module actions must use **MediatR** request/notification contracts in `Normora.Shared.Contracts.*`—never raw `event` hooks.
+
+### 4.5 Normora in Action: 5 Real-World Event Examples
+
+1. **Standard `EventHandler<TEventArgs>` for In-Process Pipeline Diagnostics (`Documents` Module)**
+   ```csharp
+   public sealed class DocumentChunkedEventArgs(Guid tenantId, Guid documentId, int chunkCount) : EventArgs
+   {
+       public Guid TenantId { get; } = tenantId;
+       public Guid DocumentId { get; } = documentId;
+       public int ChunkCount { get; } = chunkCount;
+   }
+
+   public sealed class DocumentChunkingPipeline
+   {
+       public event EventHandler<DocumentChunkedEventArgs>? DocumentChunked;
+
+       public void Complete(Guid tenantId, Guid documentId, int chunkCount)
+       {
+           DocumentChunked?.Invoke(this, new DocumentChunkedEventArgs(tenantId, documentId, chunkCount));
+       }
+   }
+   ```
+
+2. **Preventing a Scoped-to-Singleton Event Leak via `IDisposable` (`Tenants` Module)**
+   If a scoped request observer subscribes to a singleton `TenantCacheInvalidator`, it *must* implement `IDisposable` (or `IAsyncDisposable`) so the DI container unsubscribes at the end of the HTTP request:
+   ```csharp
+   public sealed class ScopedTenantAuditTracker : IDisposable
+   {
+       private readonly TenantCacheInvalidator _invalidator;
+
+       public ScopedTenantAuditTracker(TenantCacheInvalidator invalidator)
+       {
+           _invalidator = invalidator;
+           _invalidator.TenantCacheEvicted += OnTenantCacheEvicted;
+       }
+
+       private void OnTenantCacheEvicted(object? sender, Guid tenantId) { /* record metric */ }
+
+       public void Dispose() => _invalidator.TenantCacheEvicted -= OnTenantCacheEvicted;
+   }
+   ```
+
+3. **Fault-Isolated Telemetry Dispatch Using `GetInvocationList()`**
+   ```csharp
+   public void PublishChunkMetrics(EventHandler<DocumentChunkedEventArgs>? handlers, DocumentChunkedEventArgs args)
+   {
+       if (handlers is null) return;
+
+       foreach (EventHandler<DocumentChunkedEventArgs> listener in handlers.GetInvocationList())
+       {
+           try
+           {
+               listener(this, args);
+           }
+           catch (Exception ex)
+           {
+               // Isolate telemetry failures so document ingestion succeeds
+               Console.Error.WriteLine($"Telemetry listener failed: {ex.Message}");
+           }
+       }
+   }
+   ```
+
+4. **Weak Event Pattern Using `WeakReference<T>` for Long-Lived Registries**
+   When subscribers cannot reliably call `Dispose()`, store weak references and prune dead targets during dispatch:
+   ```csharp
+   public sealed class WeakWorkspaceObserverRegistry
+   {
+       private readonly List<WeakReference<Action<Guid>>> _listeners = [];
+
+       public void Subscribe(Action<Guid> callback) => _listeners.Add(new WeakReference<Action<Guid>>(callback));
+
+       public void Notify(Guid tenantId)
+       {
+           for (int i = _listeners.Count - 1; i >= 0; i--)
+           {
+               if (_listeners[i].TryGetTarget(out var callback))
+                   callback(tenantId);
+               else
+                   _listeners.RemoveAt(i); // Subscriber was GC'd cleanly
+           }
+       }
+   }
+   ```
+   *(Caution: Avoid subscribing an inline lambda `(id) => ...` to a weak-reference registry without keeping a strong reference to the delegate elsewhere—otherwise the delegate itself has no strong root and gets collected on the very next Gen 0 GC!)*
+
+5. **Architectural Upgrade: Replacing an In-Process Event with Transactional Outbox (`UploadDocumentCommandHandler`)**
+   Instead of firing an unreliable in-memory C# `event OnDocumentUploaded` (which loses work if the pod restarts), Normora writes a `DocumentProcessingOutboxMessage` inside the same `DocumentsDbContext` transaction and signals `IDocumentProcessingWakeup` for `Normora.Worker`:
+   ```csharp
+   // Inside UploadDocumentCommandHandler (Documents module):
+   // 1. Add Document, DocumentVersion, and DocumentProcessingOutboxMessage atomically
+   // 2. await dbContext.SaveChangesAsync(cancellationToken);
+   // 3. Signal durable background pickup (never a raw in-memory C# event!)
+   await wakeup.NotifyAsync(cancellationToken);
+   ```
 
 ## 5. Iterators and the State Machine (`yield return`)
 

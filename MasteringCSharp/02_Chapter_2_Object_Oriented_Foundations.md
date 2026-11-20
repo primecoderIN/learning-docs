@@ -2,31 +2,32 @@
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
-- Define Classes and instantiate Objects.
-- Understand the difference between Fields and Properties, and how properties compile to hidden methods.
-- Pass parameters to methods and understand passing by value.
-- Apply Encapsulation using access modifiers (`public`, `private`, `internal`).
-- Organize code using Namespaces.
+- Model real-world domains using **Classes** and **Objects**, understanding reference semantics, `null` safety (`CS8618`), object initializers, and `static`, `sealed`, and `partial` classes.
+- Construct valid objects using standard constructors, constructor chaining, private factory constructors, static constructors, **C# 12 Primary Constructors**, and `required`/`init` properties.
+- Enforce **Encapsulation** using all seven C# access modifiers (`public`, `private`, `internal`, `protected`, `protected internal`, `private protected`, and C# 11 `file`) plus `InternalsVisibleTo` for assembly boundaries.
+- Differentiate between **Fields**, **Properties**, **C# 14 `field`-backed properties**, `const`/`static readonly`, and **Indexers**, and trace how properties compile to hidden `get_`/`set_` IL methods.
+- Design clean **Methods** using value vs reference parameter passing (`ref`, `out`, `in`, C# 13 `params` collections) and **Extension Methods / C# 14 Extension Members**.
+- Organize large codebases using **file-scoped namespaces**, `global using`, namespace aliases, and Normora's modular monolith boundaries.
 
 ## 2. Introduction
 
-In Chapter 1, we wrote imperative code: a series of statements executing top-to-bottom. While this is fine for a simple script, enterprise software is vastly more complex. A system like our EV Charging Platform must manage Tenants, Users, Chargers, Sessions, and Invoices. 
+In Chapter 1, we wrote imperative code: a series of statements executing top-to-bottom. While that works for a small CLI script, enterprise software is vastly more complex. A multi-tenant SaaS platform like **Normora**—an enterprise knowledge management and conversational-AI system built as a **.NET 10 Modular Monolith** (an architecture where distinct business domains like `Tenants`, `Documents`, and `Conversations` run in a single backend executable while enforcing strict code and database boundaries)—must coordinate workspaces, documents, vector chunks, user memberships, and AI conversations without letting state become corrupted.
 
-To manage this complexity, C# heavily utilizes **Object-Oriented Programming (OOP)**. OOP allows us to model real-world concepts as code constructs. It groups related data (state) and behavior (logic) into a single, cohesive unit called a **Class**.
+To manage this complexity, C# relies on **Object-Oriented Programming (OOP)**. OOP lets us model domain concepts as code constructs that bundle related data (**state**) and operations (**behavior**) into a cohesive unit called a **Class**, protecting business rules (**invariants**) from accidental or malicious mutation.
 
-However, we will not just learn the syntax. We will examine how the Roslyn compiler transforms these high-level architectural concepts into lower-level instructions.
+Along the way, we will explain every new term the first time it appears—including **Roslyn** (the C# compiler), **Intermediate Language (IL)** (the CPU-independent bytecode inside `.dll` files), **CLR** (Common Language Runtime, the .NET engine that executes IL), **CQRS** (Command Query Responsibility Segregation, separating writes called *Commands* from reads called *Queries*), **BOLA** (Broken Object Level Authorization, accessing another tenant's object—mapped to HTTP `404` via `BolaException`), **BFLA** (Broken Function Level Authorization, invoking an action without role permission—mapped to HTTP `403` via `BflaException`), and **`ApiMessages`** (Normora's centralized error constants that forbid hardcoded magic error strings). We will keep our standalone EV Charging Platform walkthrough alongside real Normora production patterns so you can practice from first principles up to architect level.
 
 ## 3. Classes and Objects
 
-A **Class** is a blueprint. It defines what data an entity holds and what actions it can perform.
-An **Object** (or instance) is a specific realization of that blueprint, occupying physical memory in the application.
+A **Class** is a blueprint. It defines what data an entity holds (fields and properties) and what actions it can perform (methods).
+An **Object** (or instance) is a specific realization of that blueprint occupying physical memory on the **Managed Heap** (the dynamically allocated memory region managed by .NET's Garbage Collector).
 
 ```csharp
 // The Blueprint (Class)
 public class EvCharger
 {
     // Fields (State)
-    public string ChargerId;
+    public string ChargerId = string.Empty;
     public bool IsOnline;
 
     // Method (Behavior)
@@ -39,7 +40,7 @@ public class EvCharger
 }
 ```
 
-To use this blueprint, we must instantiate an object using the `new` keyword.
+To use this blueprint, we instantiate an object using the `new` keyword.
 
 ```csharp
 // Instantiating the Object
@@ -51,7 +52,106 @@ chargerA.IsOnline = true;
 chargerA.Reboot(); 
 ```
 
-**Compiler Insight:** When you call `new EvCharger()`, the CLR allocates a block of memory on the Managed Heap, initializes all fields to their default values (e.g., `false` for booleans, `null` for strings), and returns a memory address (a reference) pointing to that object.
+**Compiler Insight:** When you call `new EvCharger()`, the CLR allocates a block of memory on the Managed Heap, initializes all fields to their default values (e.g., `false` for `bool`, `0` for `int`, `null` for reference types), runs the constructor, and returns a memory address (**reference**) pointing to that object.
+
+### Reference Semantics, Object Initializers, and Class Modifiers
+- **What it is:** A variable of a `class` type does **not** hold the object's bytes directly; it holds an 8-byte (on 64-bit CPUs) reference pointing to the heap object. Assigning `var docB = docA;` copies the *pointer*, not the object, so both variables point to the exact same instance.
+- **Why it matters:** With `<Nullable>enable</Nullable>` enabled by default in .NET 10, leaving a non-nullable `string` property uninitialized produces compiler warning `CS8618` (*Non-nullable property must contain a non-null value when exiting constructor*). Initializing fields, using constructors, or marking properties `required` eliminates surprise `NullReferenceException` crashes.
+- **How modern C# streamlines instantiation:**
+  - **Object Initializers:** Assign accessible properties inline: `var doc = new Document { Title = "HR Policy" };`
+  - **Target-Typed `new()` (C# 9+):** Omit repeating the type name when the target type is already known: `EvCharger charger = new();`
+  - **`static` classes:** Cannot be instantiated (`new` is illegal) and may contain only `static` members—ideal for stateless helpers, extension methods, and constant catalogs.
+  - **`sealed` classes:** Prevent other classes from inheriting from them. This protects invariants and lets the JIT compiler **devirtualize** method calls (skipping virtual lookup tables for faster execution).
+  - **`partial` classes:** Split one class definition across multiple `.cs` files; Roslyn merges them at compile time (used heavily by EF Core, Source Generators, and separating generated code from custom logic).
+- **When NOT to use a `class`:**
+  - Do **not** use a mutable `class` for immutable data-transfer snapshots (CQRS Commands, Queries, DTOs) where value equality is desired—use a `record` instead (covered in Chapter 6).
+  - Do **not** use a `class` for tiny, short-lived, zero-allocation numeric/coordinate payloads in hot loops—use a `readonly struct` (covered in Chapter 4).
+  - Do **not** instantiate a normal `class` just to group stateless pure functions—use a `static class`.
+
+```mermaid
+flowchart LR
+    subgraph Stack ["Thread Execution Stack"]
+        V1["docA (8-byte reference)"]
+        V2["docB = docA (copied reference)"]
+    end
+
+    subgraph Heap ["CLR Managed Heap"]
+        OBJ["Document Instance\nId: Guid\nTitle: 'Employee Handbook'\nStatus: Ready"]
+    end
+
+    V1 -->|"points to"| OBJ
+    V2 -->|"points to same instance"| OBJ
+```
+
+### Real-World Normora Examples
+
+1. **Domain Entity Class (`Document` in `Modules/Documents/Domain`):** Models an uploaded corporate file with state (`Id`, `TenantId`, `Title`, `Status`) and lifecycle methods.
+```csharp
+namespace Normora.Modules.Documents.Domain;
+
+public sealed class Document
+{
+    public Guid Id { get; private set; }
+    public Guid TenantId { get; private set; }
+    public string Title { get; private set; } = string.Empty;
+    public bool IsArchived { get; private set; }
+
+    public void Archive() => IsArchived = true;
+}
+```
+
+2. **Tenant Root Entity (`Tenant` in `Modules/Tenants/Domain`):** Represents a workspace organization in Normora's multi-tenant platform, preventing accidental inheritance with `sealed`.
+```csharp
+namespace Normora.Modules.Tenants.Domain;
+
+public sealed class Tenant
+{
+    public Guid Id { get; private set; }
+    public string Name { get; private set; } = string.Empty;
+    public string Slug { get; private set; } = string.Empty;
+}
+```
+
+3. **Conversational State Class (`Conversation` in `Modules/Conversations/Domain`):** Groups a user's multi-turn RAG (Retrieval-Augmented Generation) thread under a specific tenant and external identity (`ExternalUserId`, decoupled from Keycloak vendor names).
+```csharp
+namespace Normora.Modules.Conversations.Domain;
+
+public sealed class Conversation
+{
+    public Guid Id { get; private set; }
+    public Guid TenantId { get; private set; }
+    public string ExternalUserId { get; private set; } = string.Empty;
+    public DateTimeOffset CreatedAtUtc { get; private set; } = DateTimeOffset.UtcNow;
+}
+```
+
+4. **Static Catalog Class (`TenantPlanPricingCatalog` in `Modules/Tenants/Domain`):** A `static` class that cannot be instantiated with `new`, serving as Normora's single source of truth for subscription pricing across currencies (`INR`, `USD`, `EUR`, etc.).
+```csharp
+namespace Normora.Modules.Tenants.Domain;
+
+public static class TenantPlanPricingCatalog
+{
+    public static decimal GetMonthlyPrice(string tier, string currency) =>
+        (tier, currency.ToUpperInvariant()) switch
+        {
+            ("Free", _) => 0m,
+            ("Pro", "USD") => 29m,
+            ("Pro", "INR") => 2499m,
+            _ => throw new ArgumentOutOfRangeException(nameof(tier))
+        };
+}
+```
+
+5. **Object Initializer + Target-Typed `new()` in Outbox Dispatch (`DocumentProcessingOutboxMessage`):** Creates a transactional outbox row atomically during document upload without ambiguous positional arguments.
+```csharp
+DocumentProcessingOutboxMessage outboxMessage = new()
+{
+    Id = Guid.NewGuid(),
+    TenantId = tenantId,
+    DocumentId = document.Id,
+    CreatedAtUtc = DateTimeOffset.UtcNow
+};
+```
 
 ## 4. Constructors
 

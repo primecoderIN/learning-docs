@@ -1,28 +1,104 @@
-# Chapter 3: The C# Ecosystem and Compilation Pipeline
+# Chapter 3: Ecosystem Evolution, Roslyn & Runtime Internals (C# 14 / .NET 10)
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
+- Trace how C# and .NET evolved from the Windows-only .NET Framework to unified cross-platform **.NET 10 (LTS)** and **C# 14**, and evaluate Target Framework Monikers (`net10.0` vs legacy `netstandard2.0`).
 - Trace the lifecycle of a C# program from source code to native CPU execution.
-- Understand the internal phases of the Roslyn compiler (Lexing, Parsing, Semantic Analysis, Emit).
-- Analyze Intermediate Language (IL) metadata and instructions.
-- Differentiate between the Common Language Runtime (CLR) components and their responsibilities.
-- Evaluate the trade-offs of Just-In-Time (JIT) compilation (RyuJIT), ReadyToRun, and NativeAOT for enterprise deployments.
+- Explain the internal phases of the **Roslyn** compiler (Lexing, Parsing, Semantic Analysis, Syntactic Lowering, Emit) and how **Incremental Source Generators** eliminate runtime reflection.
+- Inspect the anatomy of a **.NET Assembly** (PE/COFF headers, Metadata tables, IL stream, `.pdb` symbols) and understand **AssemblyLoadContext (ALC)** isolation boundaries.
+- Analyze **Intermediate Language (IL)** stack-machine instructions, including `call` vs `callvirt` vs `constrained.` dispatch and `Debug` vs `Release` output.
+- Differentiate between the **Common Language Runtime (CLR)** subsystems and explain **Tiered Compilation**, **Dynamic Profile-Guided Optimization (PGO)**, **On-Stack Replacement (OSR)**, **Devirtualization**, and **SIMD**.
+- Evaluate the trade-offs of **Just-In-Time (JIT)** compilation (**RyuJIT**), **ReadyToRun (R2R)**, and **NativeAOT** for enterprise workloads like **Normora**.
 
 ## 2. Introduction
 
-When you write a C# application, you are not writing code that directly instructs the CPU. You are participating in a sophisticated, multi-staged compilation and execution pipeline designed by Microsoft over two decades. The evolution of C# from version 1.0 (a largely Windows-bound, simple OO language) to its modern iterations (cross-platform, highly performant, blending OO and functional paradigms) has required massive architectural shifts in both the compiler and the runtime environment.
+When you write a C# application, you are not writing code that directly instructs the CPU. You are participating in a sophisticated, multi-staged compilation and execution pipeline refined over more than two decades. The evolution of C# from version 1.0 (a largely Windows-bound, simple object-oriented language) to **C# 14 on .NET 10** (cross-platform, cloud-native, blending object-oriented, functional, and low-allocation systems programming) required fundamental architectural rewrites of both the compiler and the runtime.
 
-C# was created by Anders Hejlsberg at Microsoft to provide a modern, type-safe, object-oriented language for the .NET Framework. Over time, as enterprise demands shifted towards cloud-native architectures, microservices, and extreme throughput, the ecosystem was completely rewritten. The compiler became an open-source platform (Roslyn), and the framework became cross-platform (.NET Core, now simply .NET). 
+C# was created by Anders Hejlsberg at Microsoft to provide a modern, **type-safe** (memory and type rules enforced so invalid casts or uninitialized pointers cannot silently corrupt memory) language for the .NET Framework. Over time, as enterprise systems moved to Linux containers, Kubernetes, and high-throughput SaaS platforms, Microsoft rebuilt the compiler as an open-source platform (**Roslyn**) and re-engineered the runtime into cross-platform **.NET Core**—eventually unifying the ecosystem into modern **.NET** (with **.NET 10** as the Long-Term Support release).
 
-To master C#, a Senior Software Engineer must abandon the "black box" mentality. You must understand *exactly* what happens when you press build, and *exactly* how the runtime manages your logic in memory.
+To master C#, a Senior Software Engineer or Architect must abandon the "black box" mentality. Throughout this chapter, we will anchor every compiler and runtime concept in **Normora**—a real **.NET 10 modular monolith** (a single deployable application split internally into strictly encapsulated domain modules: `Tenants`, `Documents`, and `Conversations`, paired with a `Normora.Api` HTTP/BFF host, a `Normora.Worker` Hangfire background host, `Normora.Infrastructure`, and `Normora.Shared`). Understanding *exactly* what happens when you build and run Normora is the baseline for diagnosing production latency, avoiding deployment failures, and designing fast, safe architectures.
 
-## 3. The Compilation Pipeline: From Code to Silicon
+## 3. Evolution of C# and the .NET Platform (C# 1.0 to C# 14 / .NET 10)
+
+### What It Is and Why It Matters
+When engineers talk about ".NET," they are often referring to one of three historical eras. Knowing which era an API or library comes from prevents costly architectural mistakes:
+
+1. **.NET Framework (1.0 – 4.8, 2002–2019):** Windows-only, closed-source runtime bundled with the OS. Uses legacy configuration (`web.config`), `AppDomain` isolation, and does **not** receive modern runtime performance features.
+2. **.NET Core (1.0 – 3.1) & .NET Standard (2016–2019):** A ground-up, open-source, cross-platform (Linux, macOS, Windows) rewrite. To share libraries between .NET Framework and .NET Core during the transition years, Microsoft created **.NET Standard** (a specification of common APIs, peaking at `netstandard2.0` and `netstandard2.1`).
+3. **Unified .NET (5, 6 LTS, 7, 8 LTS, 9, 10 LTS, 2020–Present):** Microsoft dropped the "Core" branding and unified server, cloud, desktop, and mobile onto one platform on an annual November release cadence:
+   - **LTS (Long-Term Support)** releases (even numbers: `.NET 6`, `.NET 8`, **`.NET 10`**) receive 3 years of security and bug fixes—these are the standard choice for enterprise production systems.
+   - **STS (Standard-Term Support)** releases (odd numbers: `.NET 7`, `.NET 9`) receive 18–24 months of support and introduce features early.
+
+In parallel, the **C# language** evolved from C# 1.0 to **C# 14** in steady architectural leaps:
+- **C# 2–4:** Generics (zero-boxing collections), LINQ & lambda expressions, `dynamic` interop.
+- **C# 5–6:** `async`/`await` compiler state machines, **Roslyn** open-source compiler, string interpolation, expression-bodied members.
+- **C# 7–9:** `Span<T>`-friendly language features (`ref struct`), pattern matching, nullable reference types, `record` types, top-level statements.
+- **C# 10–12:** File-scoped namespaces, global `using`s, `required` properties, **Primary Constructors** (constructor parameters directly on the class/struct declaration), collection expressions (`[a, b, c]`).
+- **C# 13–14:** `System.Threading.Lock` first-class `lock` support, `params` collections, the contextual `field` keyword (accessing a compiler-synthesized backing field without declaring one manually), **extension members** (extension properties as well as methods), null-conditional assignment (`obj?.Prop = value`), and unbound generics in `nameof(List<>)`.
+
+```mermaid
+flowchart LR
+    FW["2002: .NET Framework 1.0\nC# 1.0 (Windows-only, closed CLR)"] --> LINQ["2007: .NET 3.5\nC# 3.0 (LINQ, lambdas, var)"]
+    LINQ --> ASYNC["2012: .NET 4.5\nC# 5.0 (async/await state machines)"]
+    ASYNC --> CORE["2016: .NET Core 1.0\nC# 6.0 (Cross-platform, Roslyn OSS)"]
+    CORE --> UNIFIED["2020: .NET 5\nC# 9.0 (Unified .NET, records)"]
+    UNIFIED --> NET8["2023: .NET 8 LTS\nC# 12 (Dynamic PGO, Primary Constructors)"]
+    NET8 --> NET10["2025: .NET 10 LTS\nC# 14 (field keyword, extension members, JIT/AOT)"]
+```
+
+### How Target Framework Monikers (TFMs) Work
+Your `.csproj` `<TargetFramework>` element (for example, `<TargetFramework>net10.0</TargetFramework>`) tells the SDK which Base Class Library (BCL) surface area, runtime capabilities, and default C# language version (`14.0` for `net10.0`) are available at compile time.
+
+### When NOT to Target Older Frameworks or `.NET Standard 2.0`
+- **Do NOT target `netstandard2.0`** for internal enterprise libraries or application modules (such as `Normora.Shared` or `Normora.Infrastructure`). Targeting `netstandard2.0` restricts you to a 2017 API contract—blocking modern `Span<T>` overloads, `FrozenDictionary`, `SearchValues<T>`, `System.Threading.Lock`, and modern JIT intrinsics.
+- **Only target `netstandard2.0`** if you maintain a public NuGet library that *must* still be consumed by legacy .NET Framework 4.6.1–4.8 desktop or enterprise monoliths. Otherwise, target `net10.0` directly.
+
+### Real-World Normora Examples (C# 14 & .NET 10 Evolution)
+1. **Unified `net10.0` Target Across Every Normora Project:** `Normora.Api`, `Normora.Worker`, `Normora.Infrastructure`, `Normora.Shared`, and the `Tenants`, `Documents`, and `Conversations` module assemblies all target `net10.0` (LTS). Because nothing in Normora runs on legacy .NET Framework, avoiding `netstandard2.0` lets `Normora.Shared` expose modern zero-allocation primitives and EF Core 10 contracts cleanly.
+2. **Primary Constructors for Dependency Injection (`AGENTS.md` Standard):** Normora enforces C# 12+ primary constructors across all handlers and services, eliminating manual `private readonly` field boilerplate:
+   ```csharp
+   // server/Modules/Documents/Application/Documents/Commands/UploadDocument/UploadDocumentCommandHandler.cs
+   public sealed class UploadDocumentCommandHandler(
+       DocumentsDbContext dbContext,
+       IDocumentStorageService storageService,
+       IDocumentProcessingWakeup wakeup,
+       ITenantContext tenantContext) : IRequestHandler<UploadDocumentCommand, UploadDocumentResult>
+   {
+       // Parameters are captured by the compiler for use across methods
+   }
+   ```
+3. **C# 14 `field` Keyword in Domain & Options Validation:** Before C# 14, validating a property setter required declaring an explicit private backing field. In C# 14, `TenantPlan` or `GeminiOptions` can normalize inputs inline using `field`:
+   ```csharp
+   public sealed class TenantCurrencyPreference
+   {
+       public string CurrencyCode
+       {
+           get => field;
+           set => field = string.IsNullOrWhiteSpace(value)
+               ? throw new ArgumentException(ApiMessages.InvalidCurrency, nameof(value))
+               : value.Trim().ToUpperInvariant();
+       } = "USD";
+   }
+   ```
+4. **Collection Expressions (`[...]`) in `TenantPlanPricingCatalog` & Architecture Tests:** Clean, compiler-optimized initialization for immutable tier/currency tables and forbidden-namespace checks in `Normora.Architecture.Tests`:
+   ```csharp
+   private static readonly string[] SupportedCurrencies =
+       ["INR", "USD", "EUR", "GBP", "CAD", "AUD", "JPY", "SGD"];
+   ```
+5. **C# 13/14 `System.Threading.Lock` & Null-Conditional Assignment (`?.=`) in Infrastructure:** Modernizing in-process synchronization (without `Monitor` object-header contention) and concise null-safe updates when enriching telemetry tags in `Normora.Infrastructure`:
+   ```csharp
+   private readonly Lock _warmupGate = new();
+   // Null-conditional assignment (C# 14): skips RHS evaluation if activity is null
+   activity?.DisplayName = "documents.hybrid_retrieval";
+   ```
+
+## 4. The Compilation Pipeline: From Code to Silicon
 
 The execution of a modern C# application involves two distinct stages separated by time and space:
-1. **Compile-Time (Roslyn):** Translates C# source code into Intermediate Language (IL) and metadata, packaging it into an Assembly (.dll or .exe).
+1. **Compile-Time (Roslyn):** Translates C# source code into Intermediate Language (IL) and metadata, packaging it into an Assembly (`.dll` or `.exe`).
 2. **Runtime (CLR/JIT):** Translates the IL into native machine code optimized specifically for the host operating system and CPU architecture.
 
-### 4. Visual Diagram: The Complete Pipeline
+### 4.1 Visual Diagram: The Complete Pipeline
 
 ```text
 +---------------------+
@@ -87,18 +163,134 @@ The execution of a modern C# application involves two distinct stages separated 
 
 ## 5. Compiler & Runtime Internals Deep Dive
 
-### Phase 1: The Roslyn Compiler
+### 5.1 Phase 1: The Roslyn Compiler, Lowering & Incremental Source Generators
 
-Roslyn is not just a compiler; it is a "Compiler as a Service." It exposes APIs that allow tools (like your IDE or Source Generators) to inspect and modify code in real-time.
+#### What It Is and Why It Matters
+**Roslyn** (officially the `.NET Compiler Platform`) is not a monolithic "black box" binary; it is a **"Compiler as a Service"** exposing immutable data structures and APIs so IDEs, build-time analyzers, and **Source Generators** can inspect and augment your C# code during compilation.
 
-1. **Lexical Analysis (Lexing):** The compiler reads the raw text stream and breaks it down into `SyntaxToken`s (keywords, identifiers, operators, punctuation).
-2. **Parsing:** The tokens are organized into a hierarchical, immutable `SyntaxTree`. If you write `var x = 5;`, the parser constructs a tree representing a Local Declaration Statement containing a Variable Declaration with an Equals Value Clause.
-3. **Semantic Analysis:** The compiler gives *meaning* to the syntax. It creates a `Compilation` object, combining the `SyntaxTree` with referenced assemblies. It binds names to types. It knows that `x` is an `int` because it resolves the literal `5` to `System.Int32`.
-4. **Emit:** The bound tree is lowered into Intermediate Language (IL). High-level constructs (like `async`/`await` or `yield return`) are rewritten into lower-level state machines. The IL and metadata are packaged into a Portable Executable (PE) file.
+1. **Lexical Analysis (Lexing):** The compiler reads the raw text stream and breaks it down into `SyntaxToken`s (keywords, identifiers, operators, punctuation) plus `SyntaxTrivia` (whitespace and comments, preserving full source fidelity for refactoring tools).
+2. **Parsing:** The tokens are organized into a hierarchical, immutable `SyntaxTree` (implemented internally with a memory-efficient "red-green tree" so minor edits only reallocate the changed path). If you write `var x = 5;`, the parser constructs a tree representing a `LocalDeclarationStatementSyntax` containing a `VariableDeclarationSyntax` with an `EqualsValueClauseSyntax`.
+3. **Semantic Analysis:** The compiler gives *meaning* to the syntax. It creates a `Compilation` object, combining the `SyntaxTree`s with referenced assemblies. A `SemanticModel` binds names to concrete `ISymbol`s—resolving `var x = 5;` to `System.Int32`, checking accessibility (`public`, `internal`), and enforcing nullability flow analysis.
+4. **Syntactic Lowering (Desugaring):** Before generating IL, Roslyn lowers high-level C# syntax into simpler, canonical C# constructs. For example:
+   - `using var stream = ...;` lowers to `try { ... } finally { stream?.Dispose(); }`.
+   - Interpolated strings like `$"Tenant {tenantId}"` lower to `DefaultInterpolatedStringHandler` (stack-allocated formatting buffer with zero intermediate `string` allocations).
+   - **Primary constructors** lower constructor parameters into synthesized private fields (if captured by methods) and emit a standard `.ctor`.
+   - `async`/`await` and `yield return` lower into compiler-generated state-machine structs (examined in detail in Chapter 9).
+5. **Emit:** The lowered bound tree is translated into Intermediate Language (IL) and metadata tables, then written into a Portable Executable (`.dll` / `.exe`) and `.pdb` symbol file.
 
-### Phase 2: The Intermediate Language (IL)
+```mermaid
+flowchart TD
+    SRC["C# Source Files (.cs)"] --> LEX["1. Lexer (SyntaxTokens)"]
+    LEX --> PARSE["2. Parser (Immutable SyntaxTree)"]
+    PARSE --> SEM["3. Semantic Analysis (Compilation & SemanticModel)"]
+    SEM --> GEN["Incremental Source Generators (IIncrementalGenerator)"]
+    GEN -->|"Emits generated .g.cs"| PARSE
+    SEM --> LOWER["4. Lowering (Desugar Primary Ctors, using, Interpolation)"]
+    LOWER --> EMIT["5. Emit (IL + Metadata + Portable PDB)"]
+    EMIT --> ASM[".NET Assembly (.dll)"]
+```
 
-IL (or MSIL/CIL) is an object-oriented assembly language. It operates on a conceptual stack machine. Let's look at a concrete example.
+#### Incremental Source Generators (`IIncrementalGenerator`)
+A **Source Generator** hooks into Roslyn mid-compilation to inspect syntax/symbols and emit new `.g.cs` files that are compiled into the *same* assembly—eliminating runtime `System.Reflection` overhead and unlocking **NativeAOT** compatibility.
+- Legacy **`ISourceGenerator`** (introduced in .NET 5) re-ran over the entire compilation on every keystroke, causing severe IDE lag in large solutions.
+- Modern **`IIncrementalGenerator`** (.NET 6 through .NET 10) builds a memoized, node-cached pipeline (`context.SyntaxProvider.ForAttributeWithMetadataName(...)`). If you edit a controller in `Tenants`, Roslyn only re-evaluates the affected syntax nodes instead of regenerating every file in `Documents` and `Conversations`.
+
+#### When NOT to Use Custom Source Generators or Roslyn Analyzers
+- **Do NOT write a custom `IIncrementalGenerator`** when a standard generic method, interface, or built-in .NET 10 generator (`[JsonSerializable]`, `[LoggerMessage]`, `[GeneratedRegex]`, `[OptionsValidator]`) already solves the problem. Custom generators increase build-graph complexity, require separate analyzer project packaging, and are harder for teammates to debug.
+- **Do NOT use Roslyn `Compilation` APIs at runtime** inside production HTTP handlers unless you are intentionally building an IDE, script runner, or REPL—loading Roslyn into `Normora.Api` would add tens of megabytes of compiler assemblies and heavy memory pressure.
+
+#### Real-World Normora Examples (Roslyn, Lowering & Source Generators)
+1. **Primary Constructor Lowering in `CancelSubscriptionCommandHandler`:**
+   ```csharp
+   // What you write (C# 14 primary constructor):
+   public sealed class CancelSubscriptionCommandHandler(
+       TenantsDbContext dbContext,
+       ITenantContext tenantContext)
+   {
+       public async Task HandleAsync(CancellationToken ct)
+       {
+           var plan = await dbContext.TenantPlans
+               .FirstOrDefaultAsync(p => p.TenantId == tenantContext.TenantId, ct);
+           if (plan is null) throw new BolaException();
+           if (plan.Tier == SubscriptionTier.Free)
+               throw new InvalidOperationException(ApiMessages.CannotCancelFreePlan);
+       }
+   }
+   ```
+   During lowering, Roslyn synthesizes hidden backing fields (`<dbContext>P`, `<tenantContext>P`) only because `HandleAsync` captures them. If a primary constructor parameter is only passed to a `base(...)` constructor and never referenced inside methods, Roslyn lowers it directly without allocating a hidden field at all!
+2. **Zero-Allocation `[LoggerMessage]` Source Generator in `DocumentProcessingJob`:** Instead of runtime reflection/boxing inside `ILogger.LogInformation("Chunked {Count} chunks", count)`, Normora can use `.NET`'s built-in logging generator:
+   ```csharp
+   public static partial class DocumentJobLog
+   {
+       [LoggerMessage(
+           EventId = 3001,
+           Level = LogLevel.Information,
+           Message = "Processed document {DocumentId} for tenant {TenantId} into {ChunkCount} chunks")]
+       public static partial void DocumentChunked(
+           this ILogger logger, Guid documentId, Guid tenantId, int chunkCount);
+   }
+   ```
+   Roslyn generates a strongly-typed `LoggerMessage.Define` wrapper at compile time—zero `object[]` allocations, zero `int`/`Guid` boxing, and zero runtime format-string parsing (while honoring CWE-209 by keeping stack traces strictly in structured logs).
+3. **`System.Text.Json` Source Generation (`JsonSerializerContext`) for `McpController` & A2UI Cards:**
+   ```csharp
+   [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+   [JsonSerializable(typeof(McpToolCallRequest))]
+   [JsonSerializable(typeof(McpToolCallResponse))]
+   public partial class NormoraMcpJsonContext : JsonSerializerContext;
+   ```
+   Roslyn emits direct `Utf8JsonWriter`/`Utf8JsonReader` serialization code at build time, removing cold-start reflection over MCP JSON-RPC 2.0 payloads.
+4. **Compile-Time `[OptionsValidator]` for `GeminiOptions` and `MinioOptions`:** Replacing runtime reflection property walks on `ValidateDataAnnotations()` with Roslyn-generated validation code triggered by `ValidateOnStart()` in `ProviderServiceExtensions.cs`.
+5. **Compile-Time Roslyn Analyzers vs `Normora.Architecture.Tests`:** A Roslyn diagnostic analyzer can flag `throw new Exception("User not found")` directly with a red squiggle in the IDE when someone violates `AGENTS.md` Section 1 ("Always use `Normora.Shared.Constants.ApiMessages`"), catching magic-string errors at keystroke time before CI even runs.
+
+### 5.2 Assemblies, PE Metadata & `AssemblyLoadContext` (ALC)
+
+#### What It Is and Why It Matters
+When Roslyn finishes emitting, it produces a **.NET Assembly**—usually a `.dll` file (plus an optional native OS launcher `.exe` called the **apphost**). Every .NET assembly follows the **Portable Executable (PE/COFF)** binary layout, containing four crucial parts:
+1. **PE/COFF & CLR Header:** Tells the OS loader and `hostfxr`/`coreclr` that this binary contains managed .NET code and specifies the entry point.
+2. **Assembly Manifest:** Identity metadata—assembly name, version (`1.0.0.0`), culture, public key token (if strong-named), and the list of external assemblies it depends on (`AssemblyRef`).
+3. **Metadata Tables:** Compact relational tables inside the `.dll` (`TypeDef`, `MethodDef`, `Field`, `Param`, `CustomAttribute`, `MemberRef`) describing every type, method signature, and attribute. Notice how **Reflection**, EF Core's `ApplyConfigurationsFromAssembly`, and dependency injection scanners read these metadata tables without needing C# source code.
+4. **CIL (IL) Stream:** The actual stack-machine bytecode for every method body.
+*(Debugging symbols—mapping IL offsets back to `.cs` line numbers—live in a separate **Portable `.pdb`** file so production binaries stay lean while still allowing rich stack traces when `.pdb` files are deployed.)*
+
+At runtime, the `.NET` host reads two JSON sidecars generated during `dotnet build`:
+- **`Normora.Api.runtimeconfig.json`:** Declares the target framework (`Microsoft.NETCore.App` / `Microsoft.AspNetCore.App` `10.0.x`), GC settings, and Tiered Compilation flags.
+- **`Normora.Api.deps.json`:** Maps every NuGet package and project reference to its exact `.dll` path and version.
+
+#### `AssemblyLoadContext` (ALC): Isolation and Unloading
+An **`AssemblyLoadContext`** is .NET's modern replacement for legacy .NET Framework `AppDomain`s. It controls *where* assemblies are loaded from and *which* types share identity:
+- By default, every application starts in `AssemblyLoadContext.Default`.
+- **Collectible ALCs** (`new AssemblyLoadContext("PluginA", isCollectible: true)`) allow you to dynamically load a third-party plugin assembly *and later unload it* so the Garbage Collector can reclaim its IL, JITted code, and metadata!
+- **Critical Rule — Type Identity:** In the CLR, a type's identity is the tuple `(AssemblyLoadContext, Assembly, FullTypeName)`. If the *same* `Normora.Shared.dll` is loaded into two different ALCs, `PerformHybridRetrievalQuery` from ALC #1 is **not** assignment-compatible with `PerformHybridRetrievalQuery` from ALC #2!
+
+```mermaid
+flowchart LR
+    HOST["Normora.Api Host Process"] --> DEFAULT["AssemblyLoadContext.Default"]
+    DEFAULT --> API["Normora.Api.dll"]
+    DEFAULT --> SHARED["Normora.Shared.dll\n(Single Type Identity)"]
+    DEFAULT --> MODS["Tenants / Documents / Conversations .dlls"]
+    DEFAULT --> INFRA["Normora.Infrastructure.dll"]
+    HOST -.->|"Only for isolated 3rd-party plugins"| PLUGIN["Collectible ALC\n(isCollectible: true)"]
+```
+
+#### When NOT to Use Custom `AssemblyLoadContext`s
+- **Do NOT put modular monolith modules (`Tenants`, `Documents`, `Conversations`) in separate ALCs.** Normora's modules share cross-module contracts in `Normora.Shared.Contracts.*` (`PerformHybridRetrievalQuery`, `GetMcpToolsQuery`) and shared abstractions (`ITenantContext`, `BolaException`). Separating them into distinct ALCs would fracture type identity and break MediatR dispatch and DI resolution. Enforce module boundaries at compile time via project references and `Normora.Architecture.Tests` instead.
+
+#### Real-World Normora Examples (Assemblies, Metadata & ALCs)
+1. **Clean Dependency Graph in `.deps.json` (`Normora.Worker` vs `Normora.Api`):** Inspecting `Normora.Worker.deps.json` confirms that `Normora.Worker` references `Normora.Infrastructure` and `Normora.Shared`—and contains **zero** `AssemblyRef` entries for `Normora.Api` or Duende BFF. Conversely, `Normora.Modules.Documents.dll` contains zero `AssemblyRef` entries for `Minio.dll` or Google Gemini SDKs.
+2. **EF Core Metadata Scanning via `ApplyConfigurationsFromAssembly`:**
+   ```csharp
+   // Inside DocumentsDbContext.OnModelCreating:
+   modelBuilder.ApplyConfigurationsFromAssembly(typeof(DocumentsDbContext).Assembly);
+   ```
+   EF Core inspects the `TypeDef` metadata table of `Normora.Modules.Documents.dll`, finds every non-abstract class implementing `IEntityTypeConfiguration<T>`, and invokes its parameterless public constructor—which is why Normora strictly forbids injecting scoped services like `ITenantContext` into configuration constructors.
+3. **Single Type Identity for MediatR Cross-Module Contracts:** When `Conversations` sends `PerformHybridRetrievalQuery` (defined in `Normora.Shared.dll`) via MediatR to a handler in `Documents`, both modules resolve `PerformHybridRetrievalQuery` inside `AssemblyLoadContext.Default`, guaranteeing identical `RuntimeTypeHandle` pointers.
+4. **Ephemeral Migration Host (`dotnet Normora.Api.dll --migrate`):** When launched with `--migrate`, `MigrationHostExtensions.RunMigrationsAsync` constructs a minimal console host that resolves only `DatabaseMigrationRunner` and the four `IDatabaseMigrator` implementations (`Tenants`, `Documents`, `Conversations`, `Session`), intentionally never activating Kestrel, SignalR, or OpenTelemetry native listeners—preventing native teardown SIGSEGV crashes (exit code 139).
+5. **Automated Boundary Enforcement in `Normora.Architecture.Tests`:** Architecture tests load the compiled module assemblies' metadata (`typeof(TenantsDbContext).Assembly.GetReferencedAssemblies()`) to verify that business modules never reference third-party vendor SDKs or another module's private `DbContext`.
+
+### 5.3 Phase 2: The Intermediate Language (IL) & Stack-Machine Internals
+
+#### What It Is and Why It Matters
+**IL** (also called **MSIL** or **CIL**, Common Intermediate Language) is a CPU-independent, object-oriented assembly language. Instead of targeting x64 registers (`rax`, `rcx`) or ARM64 registers (`x0`, `x1`), IL operates on an **Evaluation Stack**: instructions push operands onto the stack, pop them to compute a result, and push the result back.
 
 **C# Code:**
 ```csharp
@@ -111,7 +303,7 @@ public class Calculator
 }
 ```
 
-**Generated IL (viewed via ildasm or ILSpy):**
+**Generated IL (viewed via `ildasm` or ILSpy in `Debug` mode):**
 ```il
 .method public hidebysig instance int32 Add(int32 a, int32 b) cil managed
 {
@@ -121,7 +313,7 @@ public class Calculator
     )
 
     IL_0000: nop
-    IL_0001: ldarg.1      // Load argument 'a' onto the evaluation stack
+    IL_0001: ldarg.1      // Load argument 'a' onto the evaluation stack (arg 0 is 'this')
     IL_0002: ldarg.2      // Load argument 'b' onto the evaluation stack
     IL_0003: add          // Pop two values, add them, push result
     IL_0004: stloc.0      // Pop result and store in local variable 0
@@ -133,6 +325,30 @@ public class Calculator
 ```
 
 *Note: In `Release` mode, the compiler optimizes this heavily, removing the `nop`, `stloc`, and `br.s` instructions, reducing it to simply `ldarg.1`, `ldarg.2`, `add`, `ret`.*
+
+#### Critical IL Dispatch Instructions: `call`, `callvirt`, and `constrained.`
+1. **`call`:** Direct, static method call to a known compile-time target. Used for `static` methods, `base.Method()` calls, and direct calls on value types (`struct`). **Does not** perform a null check on `this`.
+2. **`callvirt`:** Virtual dispatch through the object's **MethodTable (VTable)**—*and* automatically performs a null check on the target object reference (throwing `NullReferenceException` if null). **Important:** Roslyn intentionally emits `callvirt` even for *non-virtual* instance methods on reference types (`class`) specifically to guarantee a fast, hardware-assisted null check!
+3. **`constrained. callvirt`:** Used in generic methods (`where T : IEquatable<T>` or calling `ToString()` on `T`). If `T` is a value type (like `Guid` or `int`) that overrides the method, the JIT avoids **boxing** (wrapping a stack value inside a heap object) and emits a direct `call`!
+
+#### When NOT to Emit IL Dynamically (`Reflection.Emit` / `ILGenerator`)
+- **Do NOT use `System.Reflection.Emit` or `DynamicMethod`** in standard application code. Hand-written IL bypasses compiler type safety checks until runtime, breaks **NativeAOT** (since there is no JIT to compile new IL), and leaks memory permanently unless hosted inside a collectible `AssemblyLoadContext`. Prefer C# generics, **Source Generators**, or compiled `Expression` trees when strictly necessary.
+
+#### Real-World Normora Examples (IL & Stack-Machine Internals)
+1. **Free Null-Safety via `callvirt` in `TenantResolutionMiddleware`:** Calling `membership.Role.ToString()` or `tenantContext.EnsureActive()` on a class instance compiles to `callvirt`. Even when `EnsureActive()` is non-virtual, `callvirt` guarantees that a `null` `tenantContext` throws `NullReferenceException` before a single instruction of `EnsureActive` runs.
+2. **Direct `ldsfld` + `call` for `ApiMessages` Constants:** Writing `throw new BolaException(ApiMessages.NotFound)` compiles to `ldsfld` (load static field `ApiMessages.NotFound` onto the evaluation stack) followed by `newobj BolaException::.ctor(string)` and `throw`—zero string allocations at the call site.
+3. **Zero-Boxing Generic Dispatch (`constrained.`) on `Guid` Tenant IDs:** Comparing `tenantId.Equals(request.TenantId)` where `tenantId` is a `Guid` compiles to a direct value-type `call` (`System.Guid::Equals(valuetype System.Guid)`), whereas passing `Guid` to a non-generic `object` parameter triggers an IL `box System.Guid` instruction (allocating 24+ bytes on the managed heap).
+4. **Expression Trees vs Compiled IL in EF Core `GroupBy` (`AGENTS.md` Rule):**
+   ```csharp
+   // Compiles to an Expression Tree (data), NOT direct IL execution,
+   // so EF Core's relational translator can convert it to SQL GROUP BY:
+   var counts = await dbContext.Documents
+       .GroupBy(d => d.Status)
+       .Select(g => new { Status = g.Key, Count = g.Count() })
+       .ToListAsync(ct);
+   ```
+   Projecting to an anonymous type creates an expression tree that EF Core translates cleanly to SQL; invoking a parameterized record constructor inside `GroupBy().Select(...)` fails SQL translation and throws `InvalidOperationException`.
+5. **`Debug` `nop` Padding vs `Release` Tight IL in `DocumentChunker`:** In `Debug` builds, Roslyn emits `nop` instructions at every brace and statement boundary inside `DocumentChunker`'s Markdown heading loop so Visual Studio/VS Code breakpoints can land on empty lines. In `Release` builds, all `nop`s vanish, shrinking IL size so RyuJIT's inlining budget can inline small chunk-boundary helpers.
 
 ### Phase 3: The CLR and RyuJIT
 

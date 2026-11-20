@@ -2,10 +2,11 @@
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
-- Explain the mechanics of Polymorphism, Virtual Method Dispatch, and VTables in RyuJIT.
-- Differentiate between `class`, `struct`, and the modern `record` type, particularly regarding Value Equality.
-- Utilize advanced Pattern Matching to write declarative, functional-style code.
-- Architect Domain-Driven Design (DDD) entities for enterprise software.
+- Explain the mechanics of Polymorphism, Virtual Method Dispatch (`callvirt`), Interface Virtual Stub Dispatch (VSD), VTables, and RyuJIT Guarded Devirtualization in .NET 10.
+- Apply Composition over Inheritance, `sealed` classes, Default Interface Methods, Explicit Interface Implementation, and Variance (`in`/`out`) without falling into the Fragile Base Class trap.
+- Differentiate between `class`, `struct`, `record class`, `record struct`, and `readonly record struct` regarding memory, mutability, C# 12+ Primary Constructors, C# 14 `field` accessors, and Value Equality.
+- Utilize advanced Pattern Matching (including List Patterns and exhaustive `switch` expressions) and emulate Discriminated Unions via closed `abstract record` hierarchies.
+- Architect Rich Domain-Driven Design (DDD) Aggregates, Entities, and Value Objects while knowing when to use functional `Result` types versus domain/security exceptions.
 
 ## 2. Introduction
 
@@ -70,14 +71,74 @@ When `charger.StartCharge()` is executed:
 3. It looks up the specific slot for `StartCharge`.
 4. It jumps to the memory address stored in that slot.
 
-**Performance Impact:**
-Virtual dispatch requires memory indirection (pointer chasing). This breaks CPU instruction pipelining and prevents RyuJIT from inlining the method. While the overhead is measured in nanoseconds, in a tight loop executing millions of times, polymorphism can become a bottleneck. 
+**Performance Impact & RyuJIT Devirtualization:**
+Virtual dispatch requires memory indirection (pointer chasing). This breaks CPU instruction pipelining and prevents RyuJIT from inlining the method. While the overhead is measured in nanoseconds, in a tight loop executing millions of times—such as scoring thousands of pgvector chunks during hybrid search—polymorphism can become a bottleneck.
 
-*Enterprise Rule:* Do not make methods `virtual` by default unless you explicitly intend for them to be overridden. C# defaults to non-virtual methods for exactly this reason (unlike Java, where methods are virtual by default).
+However, modern .NET 10 RyuJIT fights back with **Devirtualization** and **Dynamic PGO (Profile-Guided Optimization)**:
+- **Static Devirtualization**: If a class or overridden method is marked `sealed` (or is `private`/`internal` with no subclasses), RyuJIT proves at JIT time that only one target exists and replaces `callvirt` with a direct, inlineable `call`.
+- **Guarded Devirtualization (GDV)**: Even when an interface or virtual method is not `sealed`, .NET 10's Tiered Compilation profiles the runtime types flowing through a call site. If 99% of calls hit `MinioDocumentStorageService`, RyuJIT emits a fast inline type check (`if (obj.MethodTable == MinioDocumentStorageService)`) and inlines the hot path, falling back to the VTable only on a miss.
 
-## 4. Records, Primary Constructors, and Value Equality
+### Interface Dispatch (Virtual Stub Dispatch) vs. Virtual Class Dispatch
+A class only has one parent class, so every overridden method sits at a **fixed, known index** in the VTable. Interfaces are harder: a class like `MinioDocumentStorageService` can implement multiple interfaces (`IDocumentStorageService`, `IAsyncDisposable`, `IHealthCheck`), and another class implementing `IDocumentStorageService` might place those methods at completely different slot offsets.
 
-In distributed systems (like microservices passing JSON over RabbitMQ), data often represents a snapshot in time. This data should be **immutable** (unchangeable after creation). 
+Because there is no single fixed VTable index for an interface method, the CLR uses **Virtual Stub Dispatch (VSD)**. Instead of a fixed array lookup, `callvirt` on an interface goes through a small generated stub with an inline cache (resolving the `MethodTable` + interface map entry). That extra indirection is why interface calls are slightly slower than class virtual calls unless devirtualized by Dynamic PGO or constrained generics (`where T : IMyInterface` with structs).
+
+### Method Hiding (`new`) vs. Overriding (`override`)
+If a derived class declares a method with the same signature as a base class method using the `new` modifier instead of `override`, it **hides** the base method rather than overriding it. Method hiding does **not** enter the VTable: the method called depends on the **compile-time variable type**, not the runtime object type. Avoid `new` hiding in domain logic—it silently breaks polymorphism and violates the Liskov Substitution Principle.
+
+### Default Interface Methods (DIM) & Explicit Interface Implementation
+- **Default Interface Methods (C# 8+)**: Allow an interface to supply a default body so you can add a capability without breaking existing implementers. Use sparingly for backward-compatible library evolution or pure trait helpers; **do not** use DIMs to smuggle mutable state or complex business workflows into interfaces (interfaces cannot hold instance fields, and multiple interfaces with conflicting DIMs trigger compiler ambiguity errors).
+- **Explicit Interface Implementation**: Writing `void IEntityTypeConfiguration<Document>.Configure(...)` implements a member *only* when accessed through the interface reference. This keeps the public API of a class clean while satisfying infrastructure contracts.
+
+### When NOT to Use Polymorphism / Virtual Dispatch
+- **Never mark methods `virtual` by default**: C# methods are non-virtual by default (unlike Java) so callers pay zero indirection unless polymorphism is intentional.
+- **Avoid polymorphism for closed data shapes**: If the set of variants is fixed and operations change often (e.g., mapping `RetrievalOutcome` to HTTP status codes), use a `record` hierarchy and `switch` pattern matching rather than adding `ToHttpResult()` virtual methods to domain models.
+- **Avoid deep inheritance trees**: More than 2–3 levels of class inheritance creates the Fragile Base Class problem; prefer `sealed` classes + interface composition.
+
+```mermaid
+flowchart LR
+    Call["Call Site: storage.SaveAsync(...)"] --> IsSealed{"Is target sealed or<br/>devirtualized by PGO?"}
+    IsSealed -- Yes --> Direct["Static 'call' + Inlining<br/>(Zero VTable Indirection)"]
+    IsSealed -- No --> IsIface{"Base Class virtual<br/>or Interface?"}
+    IsIface -- "Base virtual" --> MT1["Read Heap Object MethodTable"] --> VT["Index Fixed VTable Slot"] --> Jump1["Jump to Override"]
+    IsIface -- "Interface" --> MT2["Read Heap Object MethodTable"] --> VSD["Virtual Stub Dispatch (VSD)<br/>Lookup Interface Map + Inline Cache"] --> Jump2["Jump to Implementation"]
+```
+
+*Enterprise Rule:* Do not make methods `virtual` by default unless you explicitly intend for them to be overridden. Seal leaf implementations (`sealed class`) so RyuJIT can devirtualize and inline them automatically.
+
+### Real-World Normora Examples: Polymorphism & Dispatch
+1. **Provider Boundary (`IDocumentStorageService` + `sealed` Adapter)**: In Normora, `Normora.Modules.Documents` defines `IDocumentStorageService`, while `Normora.Infrastructure` provides `public sealed class MinioDocumentStorageService : IDocumentStorageService`. Marking the adapter `sealed` enables RyuJIT Guarded Devirtualization while keeping the `Documents` module 100% free of the `Minio` SDK.
+2. **Sequential Migration Pipeline (`IDatabaseMigrator`)**: `DatabaseMigrationRunner` iterates over `IEnumerable<IDatabaseMigrator>` containing four concrete implementations (`TenantsDatabaseMigrator`, `DocumentsDatabaseMigrator`, `ConversationsDatabaseMigrator`, `SessionDatabaseMigrator`) and calls `await migrator.MigrateAsync(ct)` polymorphically during `--migrate` startup.
+3. **Template Method in AI Agent Tools (`AgentToolBase`)**: An abstract `AgentToolBase` in `Normora.Modules.Conversations` can declare `public virtual bool RequiresHitlApproval => false;` and `protected abstract Task<ToolExecutionResult> ExecuteCoreAsync(...)`, letting `DocumentsDeleteTool` override `RequiresHitlApproval => true` to trigger `PendingApproval` persistence while `DocumentsListTool` inherits the default fast path.
+4. **Explicit Interface Implementation for EF Core Configurations**: Each module uses parameterless `IEntityTypeConfiguration<T>` classes (such as `DocumentConfiguration` in `Documents/Persistence/Configurations/`). Implementing `void IEntityTypeConfiguration<Document>.Configure(EntityTypeBuilder<Document> builder)` explicitly keeps EF Core wiring isolated to assembly scanning (`ApplyConfigurationsFromAssembly`).
+5. **Default Interface Method for Telemetry Metadata (`IWorkspaceTraceable`)**: An internal telemetry contract `IWorkspaceTraceable` can define `Guid TenantId { get; }` plus a default method `string GetSpanKey() => $"tenant:{TenantId}";` so newly added cross-module audit events automatically work with OpenTelemetry tagging without modifying every existing contract—while avoiding DIMs on stateful services like `PayUPaymentService`.
+
+## 4. Composition Over Inheritance, Sealing, and Polymorphic Design
+
+Inheritance models an **"is-a"** relationship, whereas composition models a **"has-a"** relationship. In small textbook examples, inheritance feels natural; in large enterprise systems, deep class hierarchies create the **Fragile Base Class** problem—changing one protected field or `virtual` hook in a base class silently breaks subclasses across teams.
+
+### Why Composition + `sealed` Wins in Enterprise C#
+1. **Liskov Substitution Principle (LSP)**: A subtype must honor every behavioral contract and invariant of its base type without surprising callers (such as throwing `NotSupportedException` on a method the base type promises works).
+2. **Interface Segregation Principle (ISP)**: Clients should not be forced to depend on methods they do not use. Small, single-purpose interfaces (`ITextGenerationService`, `ITextEmbeddingService`) let modules compose only what they need.
+3. **Sealing by Default**: Mark concrete handlers, services, and infrastructure adapters `sealed`. Inheritance becomes an explicit opt-in design decision rather than an accident, and RyuJIT can statically devirtualize calls.
+4. **Variance (`out` Covariance and `in` Contravariance)**:
+   - **Covariance (`out T`)**: Allows a generic interface to return a *more derived* type than declared (e.g., `IReadOnlyList<AdminAuditEvent>` can be passed where `IReadOnlyList<AuditEvent>` is expected).
+   - **Contravariance (`in T`)**: Allows a generic interface to *accept* a less derived type (e.g., an `IAuditEventFilter<AuditEvent>` can validate `AdminAuditEvent` instances).
+
+### When NOT to Use Inheritance or Variance
+- **Do not share code via a `BaseService` / `BaseHandler` class**: Inject shared collaborators via Primary Constructors instead.
+- **Do not apply `in`/`out` variance everywhere**: Only interfaces whose generic type parameter strictly appears in output (`out`) or input (`in`) positions support variance. Mutable collections (`IList<T>`) are intentionally **invariant** so you cannot insert a `Dog` into a `List<Cat>` through a `List<Animal>` reference.
+
+### Real-World Normora Examples: Composition, Sealing & Variance
+1. **Composing AI & Retrieval Pipelines (`ConversationTurnPreparer`)**: Instead of inheriting from a monolithic `BaseConversationHandler`, Normora's `ConversationTurnPreparer` composes `IQueryRewriterService`, MediatR `ISender` (to dispatch `PerformHybridRetrievalQuery` across the module boundary), and `ITextGenerationService` via constructor injection.
+2. **Interface Segregation Across AI Ports**: Rather than defining one massive `IGeminiClient` interface, `Normora.Modules.Documents` declares `ITextEmbeddingService` and `IDocumentTextExtractor`, while `Normora.Modules.Conversations` declares `ITextGenerationService`, `IQueryRewriterService`, and `ISuggestionsService`. Swapping the OCR engine never touches chat streaming.
+3. **`sealed` CQRS Handlers & Adapters**: Every operation handler in Normora (such as `public sealed class UploadDocumentCommandHandler` and `public sealed class CancelSubscriptionCommandHandler`) and every external provider (`MinioBrandingStorageService`, `GeminiEmbeddingService`) is sealed so neither other modules nor tests can subclass internal workflow state, while allowing RyuJIT devirtualization.
+4. **Preventing LSP Violations in `TenantPlan` Cancellation**: A `Free` tier workspace cannot be cancelled or reactivated (`InvalidOperationException(ApiMessages.CannotCancelFreePlan)`). Instead of creating a broken `FreePlan : PaidPlan` subclass that overrides `Cancel()` to throw `NotSupportedException` (an LSP violation), Normora models `TenantPlan` uniformly and governs tier rules explicitly through `TenantPlanPricingCatalog` and domain invariants.
+5. **Covariance & Contravariance in Workspace Reporting**: A shared audit projection endpoint can consume `IReadOnlyList<IAuditRecord>` covariantly (`IReadOnlyList<out T>`) when receiving `IReadOnlyList<DocumentUploadAuditRecord>`, while an event sink `INotificationDispatcher<in TEvent>` declared contravariantly lets a single `INotificationDispatcher<WorkspaceEvent>` handle specialized `DocumentIndexedEvent` notifications.
+
+## 5. Records, Primary Constructors (C# 12–14), and Value Equality
+
+In distributed systems and modular monoliths (like Normora passing MediatR contracts between `Conversations` and `Documents`), data often represents an immutable snapshot in time.
 
 Historically, creating immutable classes in C# required massive boilerplate:
 
@@ -100,19 +161,20 @@ public class TelemetryData
 
 ### Enter the `record` Type (C# 9+)
 
-A `record` is a reference type (like a `class`), but the compiler automatically generates the boilerplate for immutability and **Value Equality**.
+A `record` (or `record class`) is a reference type (like a `class`), but the compiler automatically generates the boilerplate for immutability and **Value Equality**.
 
 ```csharp
-// Modern C# with Primary Constructors
+// Modern C# Positional Record
 public record TelemetryData(string ChargerId, decimal Voltage);
 ```
 
 That single line of code instructs Roslyn to generate:
-1. Public init-only properties for `ChargerId` and `Voltage`.
+1. Public `init`-only properties for `ChargerId` and `Voltage`.
 2. A constructor taking both parameters.
-3. Overrides for `Equals()` and `GetHashCode()` that compare the *values* of the properties, rather than the memory address of the object.
-4. A custom `ToString()` implementation.
-5. Support for non-destructive mutation via the `with` expression.
+3. Overrides for `Equals()`, `GetHashCode()`, and `==`/`!=` that compare the *values* of the properties (plus a synthesized `EqualityContract` property so two different derived record types never falsely compare equal).
+4. A human-readable `ToString()` implementation.
+5. Support for non-destructive mutation via the `with` expression (backed by a compiler-generated copy constructor).
+6. A `Deconstruct` method for tuple/positional pattern matching.
 
 ```csharp
 var t1 = new TelemetryData("CHG-1", 240m);
@@ -126,7 +188,92 @@ bool areEqual = (t1 == t2);
 var t3 = t1 with { Voltage = 230m };
 ```
 
-*Note: C# 10 introduced `record struct`, combining the heap-allocation-free nature of structs with the synthesized equality and `with` expressions of records.*
+### `class` vs `record class` vs `struct` vs `record struct` vs `readonly record struct`
+
+| Type | Memory Location | Default Equality | Default Mutability (Positional) | Supports `with` | Best Use Case in Normora |
+|---|---|---|---|---|---|
+| `class` | Managed Heap | Reference (`Object.ReferenceEquals`) | Mutable (`get; set;` or encapsulated) | No | EF Core Entities (`Document`, `TenantMembership`), Services, CQRS Handlers |
+| `record class` (`record`) | Managed Heap | Value Equality + `EqualityContract` | Immutable (`get; init;`) | Yes | MediatR Commands/Queries, DTOs, Domain Events, Discriminated Unions |
+| `struct` | Stack / Inline | Reflection-based value check (slow unless `IEquatable<T>`) | Mutable | Yes (value copy) | Low-level interop or custom `ref struct` spans |
+| `record struct` | Stack / Inline | Compiler-synthesized fast `IEquatable<T>` | **Mutable (`get; set;`)** unless `readonly`! | Yes | Rarely needed; prefer `readonly record struct` |
+| `readonly record struct` | Stack / Inline | Compiler-synthesized fast `IEquatable<T>` | Strictly Immutable (`get; init;`) | Yes | High-frequency Value Objects (`ChunkScore`, `Money`, `TokenBudget`) |
+
+### Critical Distinction: C# 12+ Primary Constructors on `class` vs. `record`
+C# 12 brought Primary Constructors to `class` and `struct`, and Normora's coding rules mandate Primary Constructors for dependency injection in all classes. However, **a primary constructor on a `class` behaves completely differently from one on a `record`**:
+- On a **`record`**, parameters become **public `init`-only properties** participating in `Equals`/`GetHashCode`.
+- On a **`class` or `struct`**, parameters are **not properties**—they are simply in-scope constructor parameters. If referenced inside methods (like an injected `ISender`), Roslyn captures them into **private compiler-synthesized mutable fields**. If you also want immutability or public exposure on a `class`, assign them explicitly to `private readonly` fields or `get`-only properties.
+
+### Modern Property Tools: `required` (C# 11+), `field` (C# 14), and Extension Members (C# 14)
+- **`required` + `init` (Nominal Records/Classes)**: When a DTO or options class has 6+ properties, positional constructors hurt readability. Combine `required` with `init` so callers must initialize every property via object-initializer syntax at compile time.
+- **C# 14 `field` Keyword**: Historically, validating or normalizing a property inside `set` or `init` forced you to abandon auto-properties and declare a `private string _slug;` backing field. In C# 14, the contextual `field` keyword accesses the compiler-generated backing field directly inside the accessor, preserving encapsulation without boilerplate.
+- **C# 14 Extension Members (`extension(...)`)**: Lets you attach pure functional helpers, extension properties, and operators to existing records or domain types in a static class without polluting the core domain model.
+
+### The Shallow Immutability Trap
+A `record` guarantees **shallow immutability** only. If a `record` holds a `List<string>` or `Dictionary<string, string>`, someone can still call `dto.Tags.Add("secret")`, mutating the "immutable" record and corrupting its `GetHashCode()` if used as a dictionary key! Moreover, `record` equality checks `List<T>` by **reference**, not element-by-element. Use `ImmutableArray<T>`, `IReadOnlyList<T>` (with defensive copies), or `FrozenDictionary<TKey, TValue>` for collection properties inside records.
+
+### When NOT to Use `record`
+- **Never use `record` for EF Core Entities**: EF Core's Change Tracker relies on reference identity and controlled property mutation. Two distinct rows or detached snapshots with equal property values break tracking graphs and `DbContext.Update()` semantics.
+- **Never use mutable `record struct` without `readonly`**: Positional `record struct Point(int X, int Y)` generates **settable** `X` and `Y` properties—always write `readonly record struct` for value-type Value Objects.
+- **Avoid huge `record struct` (> 16–24 bytes) passed by value frequently**: Structs copy on every method call unless passed via `in` / `ref readonly`.
+
+### Real-World Normora Examples: Records, Primary Constructors & `field`
+1. **Cross-Module MediatR Contract (`record`)**:
+   ```csharp
+   // Normora.Shared.Contracts.Documents
+   public sealed record PerformHybridRetrievalQuery(
+       Guid TenantId,
+       string QueryText,
+       int TopK,
+       Guid? DepartmentId = null) : IRequest<HybridRetrievalResponse>;
+   ```
+   Explicitly carrying `Guid TenantId` guarantees tenant isolation across both HTTP requests and Hangfire worker jobs, while `sealed record` gives free value equality for unit test assertions.
+2. **DI via C# 12+ Primary Constructor in a Normora Handler (`class`)**:
+   ```csharp
+   // Normora.Modules.Documents/Application/Documents/Commands/UploadDocument/
+   public sealed class UploadDocumentCommandHandler(
+       DocumentsDbContext dbContext,
+       IDocumentStorageService storageService,
+       IDocumentProcessingWakeup wakeup) : IRequestHandler<UploadDocumentCommand, UploadDocumentResult>
+   {
+       public async Task<UploadDocumentResult> Handle(UploadDocumentCommand request, CancellationToken ct)
+       {
+           // Parameters are captured privately; no manual field declarations needed.
+           await storageService.UploadAsync(request.StorageKey, request.Content, ct);
+           // ... persist Document, DocumentVersion, DocumentProcessingOutboxMessage atomically
+           await wakeup.SignalAsync(ct);
+           return new UploadDocumentResult(request.DocumentId);
+       }
+   }
+   ```
+3. **Zero-Allocation Value Object (`readonly record struct`)**:
+   ```csharp
+   public readonly record struct ChunkTokenBudget(int MaxContextTokens, int ReservedForSystemPrompt)
+   {
+       public int AvailableForChunks => Math.Max(0, MaxContextTokens - ReservedForSystemPrompt);
+   }
+   ```
+   Used inside `ConversationTurnPreparer` for token budgeting without allocating on the GC heap.
+4. **C# 14 `field` Keyword + `required` / `init` for Domain Options**:
+   ```csharp
+   public sealed record TenantSlugRequest
+   {
+       public required string Slug
+       {
+           get;
+           init => field = string.IsNullOrWhiteSpace(value)
+               ? throw new ArgumentException(ApiMessages.InvalidTenantSlug, nameof(Slug))
+               : value.Trim().ToLowerInvariant();
+       }
+   }
+   ```
+   Notice how `field` validates and normalizes `Slug` in `init` without declaring a separate `_slug` field, and throws using `ApiMessages` (never magic strings).
+5. **Avoiding Shallow Immutability Traps in Hybrid Search Results**:
+   ```csharp
+   public sealed record HybridRetrievalResponse(
+       Guid TenantId,
+       ImmutableArray<RetrievedChunkDto> Chunks);
+   ```
+   Using `ImmutableArray<RetrievedChunkDto>` ensures downstream `Conversations` callers cannot mutate the retrieved chunk list returned by `Documents`. And when updating a tenant plan snapshot in memory, `var annual = monthlyPlan with { BillingCycle = BillingCycle.Annual };` produces a clean new record without touching the original snapshot.
 
 ## 5. Pattern Matching
 

@@ -2,41 +2,53 @@
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
-- Explain the Mark-and-Sweep algorithm and the Generational Garbage Collection model.
-- Identify the differences between the Small Object Heap (SOH) and the Large Object Heap (LOH).
-- Analyze GC Roots and memory pinning.
-- Implement the `IDisposable` and `IAsyncDisposable` interfaces correctly.
-- Understand Finalizers and the Finalization Queue.
-- Measure and reduce GC pressure in high-throughput enterprise systems.
+- Explain the Mark-and-Sweep-and-Compact algorithm, GC Roots, Write Barriers, and Card Tables.
+- Describe the Generational Garbage Collection model (Gen 0, Gen 1, Gen 2), Heap Regions, and .NET 10's **DATAS** (Dynamic Adaptation To Application Sizes).
+- Identify the differences between the Small Object Heap (SOH), the Large Object Heap (LOH), and the Pinned Object Heap (POH).
+- Choose and configure GC modes (Server vs. Workstation, Background vs. Blocking) and measure GC pressure using .NET diagnostic tools and OpenTelemetry.
+- Implement `IDisposable`, `IAsyncDisposable`, and `SafeHandle` correctly—and know when **not** to implement them.
+- Understand Finalizers, the Finalization/Freachable Queues, Resurrection, `WeakReference<T>`, and `ConditionalWeakTable<TKey, TValue>`.
+- Reduce GC pressure in high-throughput enterprise systems like **Normora** using `ArrayPool<T>`, `ObjectPool<T>`, `ArrayBufferWriter<byte>`, and `stackalloc`.
 
 ## 2. Introduction
 
 In C++, developers must manually call `delete` to free memory they allocated with `new`. A single missed `delete` causes a memory leak; a double `delete` causes memory corruption and application crashes.
 
-To eliminate these entire classes of bugs, the .NET Common Language Runtime (CLR) abstracts memory management away from the developer using a **Garbage Collector (GC)**. However, as an enterprise software engineer, you cannot treat the GC as a magic box. In high-performance systems—such as our Multi-Tenant EV Charging Platform processing millions of telemetry packets—the GC is often the single largest source of unpredictable latency.
+To eliminate these entire classes of bugs, the .NET Common Language Runtime (CLR) abstracts memory management away from the developer using a **Garbage Collector (GC)**—an automatic memory manager that tracks which objects on the managed heap are still reachable by your code and reclaims the rest. However, as an enterprise software engineer, you cannot treat the GC as a magic box. In high-performance systems—whether a Multi-Tenant EV Charging Platform processing millions of telemetry packets or **Normora** streaming multi-turn RAG responses, chunking large PDFs, and computing cosine similarities across thousands of `pgvector` embeddings—the GC is often the single largest source of unpredictable tail latency.
 
-When the GC runs, it must ensure that memory is not mutated while it is being analyzed. To do this, it often triggers a **"Stop The World"** event, suspending all application threads. A GC pause of 500 milliseconds might be acceptable in a desktop app, but it is catastrophic for a high-frequency trading system or an IoT ingestion pipeline. 
+When the GC runs certain phases, it must ensure that memory is not mutated while object references are being inspected or moved. To do this, it triggers a **"Stop The World" (STW)** pause, briefly suspending managed application threads. A GC pause of 500 milliseconds might be invisible in a desktop utility, but it causes SSE token streams to stutter in `Conversations`, Hangfire ingestion jobs in `Normora.Worker` to miss heartbeats, and p99 HTTP latency in `Normora.Api` to spike.
 
 You must learn to work *with* the Garbage Collector, not against it.
 
-## 3. The Mark-and-Sweep Algorithm
+## 3. The Mark-and-Sweep Algorithm, GC Roots, and Card Tables
 
-The .NET GC is a **Tracing Garbage Collector** that uses a Mark-and-Sweep-and-Compact algorithm.
+### What It Is & Why It Exists
+The .NET GC is a **Tracing, Compacting Garbage Collector**. Rather than counting references on every variable assignment (reference counting, which struggles with circular references such as a `Document` referencing its `DocumentChunk`s while each chunk references its parent `Document`), the .NET GC periodically traces reachable object graphs from known starting points and reclaims everything unreachable.
 
-### Phase 1: Marking (Finding Live Objects)
-The GC must determine which objects are still being used by your application. It does this by starting at **GC Roots**.
-A GC Root is a fundamental reference that the runtime knows is active. Examples include:
-- Local variables on a thread's active stack.
-- Static variables (which live for the lifetime of the AppDomain/Process).
-- CPU Registers currently pointing to objects.
-- Objects on the Finalization Queue (awaiting cleanup).
+### How It Works
 
-The GC traverses the object graph starting from these roots. Every object it reaches is "marked" as alive. If an object `A` has a field referencing object `B`, and `A` is marked, `B` is also marked.
+#### Phase 1: Marking (Finding Live Objects)
+The GC must determine which objects are still being used by your application. It starts at **GC Roots**—fundamental references the runtime knows are actively reachable:
+- **Stack locals and parameters**: Local variables and method arguments on every active thread's call stack (including hoisted fields inside `async` state machines while an `await` is pending).
+- **CPU registers**: Registers currently holding object references in executing JIT-compiled code.
+- **Static fields**: `static` fields on loaded types, which live for the lifetime of the `AssemblyLoadContext` / process (in .NET 10, there is a single default `AppDomain` unless custom unloadable `AssemblyLoadContext`s are created).
+- **GC Handles (`GCHandle`)**: Explicit handles created by runtime internals, pinned buffers, or interop layers.
+- **Freachable Queue**: Objects awaiting execution of their finalizer (covered in Section 8).
 
-### Phase 2: Sweeping and Compacting
+The GC traverses the object graph starting from these roots. Every object it reaches is **marked** as alive. If object `A` has a field referencing object `B`, and `A` is marked, `B` is also marked—even if `A` and `B` reference each other in a cycle.
+
+#### Phase 2: Sweeping and Compacting
 Any object on the managed heap that was *not* marked is considered dead (unreachable). The GC reclaims the memory occupied by these dead objects.
 
-Because objects are allocated contiguously, deleting random objects leaves holes in memory (fragmentation). To solve this, the GC **Compacts** the heap. It physically moves the surviving objects down in memory to remove the gaps, and then updates all variables in your application (the roots) to point to the new memory addresses.
+Because objects on the Small Object Heap are allocated contiguously (one right after another via a fast bump-pointer), reclaiming scattered dead objects leaves holes in memory (**fragmentation**). To solve this, the GC **Compacts** the heap: it physically copies surviving objects down to close the gaps and updates every root and internal object reference to point to the new memory addresses.
+
+```mermaid
+flowchart TD
+    Roots["GC Roots (Stack, Statics, Registers, GCHandles)"] -->|"1. Mark reachable graph"| Mark["Mark Phase: Walk live references"]
+    Mark -->|"2. Unmarked objects"| Dead["Sweep: Reclaim dead memory blocks"]
+    Mark -->|"3. Marked survivors"| Compact["Compact: Slide survivors together and update pointers"]
+    Compact -->|"4. Result"| Heap["Contiguous free space for fast bump-pointer allocation"]
+```
 
 **Visual Diagram: Heap Compaction**
 ```text
@@ -50,98 +62,350 @@ After Compaction (Pointers Updated!):
 [Obj A (Live)] [Obj D (Live)] [Free Space .................................]
 ```
 
-## 4. The Generational Model
+#### How Gen 0 Avoids Scanning the Entire Heap: Write Barriers and Card Tables
+If every quick Gen 0 collection had to scan every Gen 2 object just to see whether an old object points to a new Gen 0 object, generational GC would be slow. The CLR solves this with two low-level mechanisms:
+1. **Write Barrier**: Whenever your code assigns a reference field on a heap object (`parent.Child = newChild`), the JIT emits a tiny machine-code helper (a write barrier) instead of a plain pointer store.
+2. **Card Table**: A compact bitmask covering the entire managed heap (each bit—or "card"—represents a small range of memory, typically 128 bytes on 32-bit or 256 bytes on 64-bit). When a reference write occurs, the write barrier sets the bit for that memory range in the Card Table. During a Gen 0 collection, the GC only scans dirty cards in older generations instead of walking the entire Gen 2 object graph.
 
-Tracing the entire heap takes a long time. To optimize this, the .NET GC uses a heuristic: **"Newly created objects are likely to die quickly. Older objects are likely to survive for a long time."**
+### When NOT to Rely on Manual Intervention
+- **Never** try to "help" the GC by setting local variables to `null` at the end of a method. The .NET JIT compiler tracks variable liveness per instruction; once a local is no longer read in the method, the JIT stops reporting it as a GC Root immediately—even before the method returns (unless a debugger is attached).
+- **Never** force `GC.Collect()` to "clean up" after a single request; tracing and compacting prematurely burns CPU and distorts the GC's self-tuning budgets.
 
-The Managed Heap is divided into three Generations:
+### Real-World Normora Examples (Mark, Sweep & Roots)
+1. **Active HTTP Request Roots (`PerformHybridRetrievalQuery`)**: While `Conversations` executes `PerformHybridRetrievalQuery` across `MediatR`, the `CancellationToken`, query record, and retrieved `HybridChunkResult` list sit on the thread stack (and inside the `async` state machine), acting as GC Roots until the SSE stream completes.
+2. **Static Constants (`ApiMessages` and `RagConstants`)**: Static `string` literals and `FrozenDictionary` / `TenantPlanPricingCatalog` tables in `Normora.Shared` and `Normora.Modules.Tenants.Domain` are rooted by static type metadata for the entire process lifetime—which is intentional because they are immutable and shared across all tenants.
+3. **EF Core Change Tracker Retention (`DocumentsDbContext`)**: When loading 500 `DocumentChunk` entities *without* `.AsNoTracking()` inside a read-only search query, `DocumentsDbContext.ChangeTracker` holds references to every entity. As long as the scoped `DbContext` is alive for the request, those chunks remain marked as live and cannot be swept.
+4. **Card Table Dirtying on Singleton Cache Updates**: When a long-lived `HybridCache` or `IMemoryCache` entry in Gen 2 stores a newly created `TenantBrandingDto` (allocated in Gen 0) after a tenant updates its logo, the JIT write barrier marks that cache bucket's Card Table entry dirty so the next Gen 0 GC knows to treat that new DTO as live.
+5. **Circular References in Domain Graphs (`Document` ↔ `DocumentVersion`)**: A `Document` navigation property pointing to its `DocumentVersion` collection, where each `DocumentVersion` holds a back-reference to `Document`, forms a cycle. Once the HTTP request finishes and the root (`DbContext`) is disposed, neither object is reachable from any GC Root, so Mark-and-Sweep reclaims the entire cycle cleanly without reference-counting leaks.
 
-- **Generation 0 (Gen 0):** This is where new objects are allocated. It is very small and fits entirely in the CPU L2/L3 cache. When Gen 0 fills up, a Gen 0 GC occurs. This is extremely fast (often < 1 millisecond). Surviving objects are promoted to Gen 1.
-- **Generation 1 (Gen 1):** Acts as a buffer between short-lived and long-lived objects. If a Gen 1 GC occurs, survivors are promoted to Gen 2.
-- **Generation 2 (Gen 2):** Contains long-lived objects (e.g., singletons, static caches). A Gen 2 GC (also known as a Full GC) traces the *entire* heap. This is the expensive "Stop The World" pause you must avoid.
+## 4. The Generational Model, Heap Regions, and DATAS (.NET 10)
 
-## 5. The Large Object Heap (LOH)
+### What It Is & Why It Exists
+Tracing the entire heap takes time proportional to the number of live objects. To keep almost all collections under a millisecond, the .NET GC uses the **Weak Generational Hypothesis**: *"Newly created objects are likely to die quickly. Older objects are likely to survive for a long time."*
 
-The Generational model applies to the **Small Object Heap (SOH)**. 
-However, copying a 10-megabyte array during compaction would ruin performance. Therefore, any object **85,000 bytes or larger** is allocated on a separate heap called the **Large Object Heap (LOH)**.
+### How It Works
 
-**LOH Rules:**
-- LOH objects are never compacted by default (to avoid expensive memory copies), which leads to fragmentation.
-- LOH allocations are collected *only* during a Full Gen 2 GC.
-- Because arrays of `double` (8 bytes) hit the 85,000-byte limit at roughly 10,600 elements, it is surprisingly easy to accidentally allocate on the LOH.
+#### Generations (0, 1, and 2)
+The Small Object Heap (SOH) is logically divided into three generations:
+- **Generation 0 (Gen 0):** Where almost all new small objects are allocated (using per-thread **Thread-Local Allocation Buffers (TLABs)** so threads can allocate lock-free). Gen 0 is small enough to fit well in CPU L2/L3 cache. When Gen 0 fills up, a Gen 0 GC occurs (typically < 1 ms). Surviving objects are promoted to Gen 1.
+- **Generation 1 (Gen 1):** Acts as an ephemeral shock-absorber between short-lived and long-lived objects. Objects that survive a Gen 1 collection are promoted to Gen 2. (Gen 0 and Gen 1 together are called the **ephemeral generations**.)
+- **Generation 2 (Gen 2):** Contains long-lived objects (DI singletons, `IOptions<GeminiOptions>`, caches, thread pools). A Gen 2 GC traces the *entire* managed heap (including LOH and POH). Even with Background GC, parts of a Gen 2 collection require STW pauses and substantial CPU.
 
-## 6. Deterministic Cleanup: IDisposable and using
+#### Heap Regions (Modern .NET) & DATAS (.NET 9 / .NET 10)
+- **Regions Instead of Fixed Segments**: Historically, .NET allocated large contiguous virtual memory *segments* (e.g., 16 MB–4 GB). Modern .NET uses smaller, flexible **GC Regions** (typically 4 MB for SOH). Instead of physically copying Gen 1 survivors across segments to promote them to Gen 2, the GC can often simply relabel an entire region from Gen 1 to Gen 2, reducing pause times and memory waste.
+- **DATAS (Dynamic Adaptation To Application Sizes)**: Enabled **by default** in .NET 9 and .NET 10 Server GC, DATAS continuously monitors actual live heap size and allocation throughput. Under low traffic, DATAS shrinks the heap count and total memory footprint so idle microservices don't hoard gigabytes of RAM; under heavy bursts, it scales heaps up automatically to maximize throughput.
 
-The GC manages *memory*, but it does not manage *unmanaged resources* like File Handles, Network Sockets, Database Connections, or native OS locks. If you don't release a file handle, the OS will keep the file locked even if the C# object holding it is garbage collected.
+#### The "Mid-Life Crisis" Anti-Pattern
+An object exhibits a **mid-life crisis** when it lives *just* long enough to survive Gen 0 and Gen 1 (getting promoted to Gen 2), and then immediately dies. Because Gen 2 collections happen infrequently, these dead objects bloat Gen 2 until an expensive Full GC finally clears them.
 
-To release unmanaged resources deterministically (immediately when you are done), you implement the `IDisposable` interface.
+### When NOT to Optimize for Generations
+- Do **not** pool tiny, short-lived objects (like a 40-byte `Command` record or a small `ApiResponse<T>` envelope). Gen 0 allocation and collection of ephemeral objects is virtually free—often faster than the synchronization cost of returning an object to a shared pool!
 
+### Real-World Normora Examples (Generational Model & DATAS)
+1. **Gen 0 Ephemeral Request DTOs (`DocumentSummaryDto`)**: When `DocumentsController` maps query results to `DocumentSummaryDto` and serializes them via `System.Text.Json`, those DTOs die milliseconds later when the HTTP response flushes—collected effortlessly in Gen 0.
+2. **Gen 1 Ephemeral Survivors (`UploadDocumentCommandHandler`)**: During a document upload, the `DocumentProcessingOutboxMessage` and multipart metadata might survive one rapid Gen 0 collection occurring concurrently on another thread, resting briefly in Gen 1 before finishing the transaction and dying.
+3. **Gen 2 Long-Lived Singletons (`TenantPlanPricingCatalog` & `IAgentToolRegistry`)**: Normora's 19-tool `IAgentToolRegistry`, `IOptions<MinioOptions>`, and `TenantPlanPricingCatalog` live for the entire uptime of `Normora.Api`. They quickly settle in Gen 2 and are rarely revisited during ephemeral collections.
+4. **Mid-Life Crisis in Slow AI Calls (`GeminiTextGenerationService`)**: If a handler allocates a large prompt string and raw JSON context *before* awaiting a 12-second streaming Gemini API call, those intermediate buffers survive multiple Gen 0/1 collections triggered by other concurrent tenants, getting promoted to Gen 2 right before the turn ends and they become garbage.
+5. **DATAS in `Normora.Worker` Burst vs. Idle Cycles**: When a tenant uploads 200 policy PDFs at 9:00 AM, Hangfire worker threads spike allocations and DATAS expands active Server GC heaps to maintain ingestion throughput. Overnight when no uploads arrive, DATAS contracts heap memory back down automatically without restarting the container.
+
+## 5. Special Heaps: Large Object Heap (LOH) and Pinned Object Heap (POH)
+
+### What It Is & Why It Exists
+The generational model works great for small objects because copying a 200-byte object during compaction is cheap. Copying a 10-megabyte array during compaction would stall the CPU. Therefore, the CLR routes special allocations to dedicated heaps:
+- **Large Object Heap (LOH)**: Any single object **85,000 bytes or larger** is allocated directly on the LOH.
+- **Pinned Object Heap (POH)** *(introduced in .NET 5)*: A dedicated heap for objects that must remain at a fixed physical memory address (pinned) for native interop or asynchronous socket I/O without fragmenting the SOH.
+
+### How It Works
+
+#### LOH Rules
+- **Threshold**: `>= 85,000` bytes. On 64-bit .NET, a `byte[85_000]`, a `string` with ~42,500 UTF-16 `char`s, or a `float[21_250]` (4 bytes each) lands on the LOH.
+- **Collection Frequency**: LOH objects are treated logically like Gen 2—they are reclaimed **only during a Gen 2 (Full) GC**.
+- **Fragmentation & Compaction**: To avoid expensive memory copies, the LOH is **not compacted by default** (it uses a free-list allocator to fit new large objects into gaps). Repeatedly allocating and freeing varying-size large objects fragments the LOH, inflating process memory or even causing `OutOfMemoryException` despite free space existing in scattered holes. You can request a one-time LOH compaction when truly necessary:
+  ```csharp
+  GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+  GC.Collect(); // Expensive STW pause—use only in rare maintenance windows, never per-request
+  ```
+
+#### POH Rules
+Pinning a normal SOH object (via `fixed` or `GCHandle.Alloc(obj, GCHandleType.Pinned)`) acts like a boulder in the middle of the heap—the compactor must work around it, causing severe SOH fragmentation. Instead, allocate long-lived pinned buffers on the **POH**:
+```csharp
+// Allocated directly on the Pinned Object Heap; zero SOH fragmentation
+byte[] pinnedIoBuffer = GC.AllocateArray<byte>(length: 4096, pinned: true);
+
+// Skip zero-initialization when you will immediately overwrite every byte
+byte[] fastPinnedBuffer = GC.AllocateUninitializedArray<byte>(length: 4096, pinned: true);
+```
+
+### When NOT to Use LOH or POH
+- **Do NOT** allocate `>= 85 KB` buffers or huge concatenated strings per request; stream data in chunks (`< 85 KB`, typically 4 KB–64 KB) or use `ArrayPool<T>`.
+- **Do NOT** use `GC.AllocateArray(..., pinned: true)` for short-lived buffers that aren't actually pinned for native/async I/O. POH objects are only collected during Gen 2 collections (though modern .NET reduces overhead, POH is still meant for long-lived or pooled I/O buffers, not throwaway objects).
+
+### Real-World Normora Examples (LOH & POH)
+1. **Batch Gemini Embeddings (`GeminiEmbeddingService`)**: A single 1536-dimensional `float[]` embedding is `1536 * 4 = 6,144` bytes (comfortably on SOH). However, materializing a contiguous 2D or flattened array for a 100-chunk `batchEmbedContents` call (`100 * 1536 * 4 = 614,400` bytes) hits the **LOH** immediately unless processed as individual pooled slices or streamed.
+2. **PDF Upload Buffering (`MinioDocumentStorageService`)**: Calling `stream.CopyTo(memoryStream)` and `memoryStream.ToArray()` on a 12 MB employee handbook PDF allocates a 12 MB `byte[]` on the LOH (plus intermediate resizing arrays on the LOH as `MemoryStream` doubles in capacity!). Streaming directly from the HTTP request / `Stream` into MinIO avoids the LOH completely.
+3. **Oversized RAG Prompt & Gemini JSON Strings (`ConversationTurnPreparer`)**: Concatenating 25 retrieved document chunks plus conversation history into a single 60,000-character `string` (`120,000` bytes in UTF-16) places that `string` directly onto the LOH for every chat turn. Streaming JSON via `Utf8JsonWriter` or keeping chunk assembly buffered avoids LOH bloat.
+4. **Kestrel / SignalR Socket Buffers on POH (`Normora.Api`)**: When `Normora.Api` pushes real-time SSE tokens and SignalR `dataVersion` updates across thousands of concurrent WebSockets, ASP.NET Core's `PinnedBlockMemoryPool` allocates slab buffers on the **POH** so the OS network stack can write directly to fixed memory addresses without fragmenting Gen 0/1/2.
+5. **Large OpenAPI / Audit Log Export Serialization**: Exporting thousands of `AuditLogs` rows into a single `JsonSerializer.Serialize(logs)` string puts a massive string on the LOH. Using `JsonSerializer.SerializeAsync(httpResponse.Body, logs)` streams UTF-8 bytes directly to the response stream in small pooled chunks.
+
+## 6. GC Modes, Latency Tuning, and Observability in .NET 10
+
+### What It Is & Why It Exists
+The CLR ships two primary GC engines and multiple latency/concurrency modes because a background batch ETL job and an interactive low-latency API have opposite optimization goals.
+
+### How It Works
+
+| Mode / Setting | Behavior | Best For | Caution |
+|---|---|---|---|
+| **Server GC** (`ServerGarbageCollection=true`, default in ASP.NET Core) | Creates dedicated GC threads and heaps per CPU core (scaled dynamically by **DATAS** in .NET 9/10); collects in parallel. | `Normora.Api` and `Normora.Worker` multi-core web/worker hosts. | In tightly constrained containers (< 2 vCPUs or low RAM), monitor heap count; .NET 10 DATAS mitigates historical bloat. |
+| **Workstation GC** (`ServerGarbageCollection=false`) | Single GC thread, single heap, tuned for minimal UI pauses and low baseline RAM. | Desktop apps, CLI tools (`Normora.Api --migrate`), tiny single-core pods. | Lower peak allocation throughput under heavy multi-core concurrency. |
+| **Background (Concurrent) GC** (default `true`) | Runs Gen 2 mark/sweep concurrently on a dedicated background thread while app threads keep allocating in Gen 0/1. | Interactive APIs (`Normora.Api`) needing smooth SSE/SignalR latency. | Uses slightly more CPU and memory overhead to track mutations during collection. |
+| **Non-Concurrent GC** (`ConcurrentGarbageCollection=false`) | Halts app threads for the entire Gen 2 collection. | Pure batch throughput where pause duration does not matter. | Causes multi-hundred-millisecond freezes on user-facing requests. |
+
+#### Container Memory Limits & `DATAS`
+Modern .NET (6 through 10) automatically reads Linux cgroup v1/v2 memory and CPU limits inside Docker/Kubernetes. By default, the GC sets its hard heap limit to roughly 75% of the container's memory limit (or `DOTNET_GCHeapHardLimit` if explicitly configured), preventing OOMKills (`Exit Code 137`) by triggering collections earlier when container RAM approaches capacity.
+
+#### Latency Modes & `GC.TryStartNoGCRegion`
+For ultra-critical bounded code sections (like financial matching engines), `GCSettings.LatencyMode` (`Interactive`, `SustainedLowLatency`, `Batch`) or `GC.TryStartNoGCRegion(totalSize)` temporarily suppresses blocking collections.
+
+### When NOT to Use Latency Overrides or Manual Tuning
+- **Do NOT** call `GC.TryStartNoGCRegion` in web handlers, MediatR pipelines, or EF Core queries—if an allocation exceeds the pre-reserved budget or another thread allocates concurrently, the region aborts or destabilizes latency across the process.
+- **Do NOT** disable Background GC on `Normora.Api`; only consider disabling it on isolated offline batch workers if profiling proves higher throughput helps.
+
+### Measuring & Observing GC Pressure
+Before tuning anything, measure:
+- **In Code (`GC.GetGCMemoryInfo()`)**: Inspect `HeapSizeBytes`, `FragmentedBytes`, `PauseDurations`, and `GenerationInfo` programmatically.
+- **Per-Thread Allocation (`GC.GetAllocatedBytesForCurrentThread()`)**: Assert zero-allocation hot paths in unit/performance tests.
+- **CLI Tools**:
+  - `dotnet-counters monitor -p <pid> --counters System.Runtime` (live Gen 0/1/2 counts, `% Time in GC`, Allocation Rate MB/s, LOH size).
+  - `dotnet-gcdump collect -p <pid>` (lightweight heap snapshot to find what is holding Gen 2 memory).
+- **BenchmarkDotNet**: Add `[MemoryDiagnoser]` to microbenchmarks to see exact `Allocated` bytes and Gen 0/1/2 counts per operation.
+- **OpenTelemetry (`Normora.Infrastructure`)**: Export built-in `System.Runtime` meter metrics (`dotnet.gc.collections`, `dotnet.gc.heap.total_allocated`, `dotnet.gc.pause.time`) directly to your observability dashboard.
+
+### Real-World Normora Examples (Modes & Observability)
+1. **`Normora.Api` Using Server GC + DATAS**: Under concurrent Angular SPA requests, SignalR broadcasts, and `/api/copilotkit` SSE streams, Server GC with .NET 10 DATAS parallelizes collections across cores while keeping memory footprint proportional to active tenant load.
+2. **Ephemeral Migration Host (`Normora.Api --migrate`)**: Per Normora's architecture rules, schema migrations execute in a lean console host (`MigrationHostExtensions.RunMigrationsAsync`) that exits cleanly right after running the four `IDatabaseMigrator`s—Workstation GC keeps startup memory minimal for this short-lived CLI process.
+3. **Container OOM Prevention in `Normora.Worker`**: Running parallel Hangfire PDF text extraction jobs inside a 1 GB Docker container relies on cgroup-aware `DOTNET_GCHeapHardLimit` so the GC aggressively reclaims Gen 2/LOH buffers before the Linux kernel OOM-kills the worker.
+4. **OpenTelemetry GC Telemetry in `Normora.Infrastructure`**: Watching `dotnet.gc.pause.time` alongside `PerformHybridRetrievalQuery` trace spans immediately reveals whether a p99 latency spike came from `pgvector` HNSW search or a Full Gen 2 GC pause.
+5. **Benchmarking `DocumentChunker` with `[MemoryDiagnoser]`**: Before and after optimizing Markdown heading breadcrumb concatenation, running BenchmarkDotNet with `[MemoryDiagnoser]` proves whether allocated bytes per 100 KB Markdown file dropped from 450 KB (with Gen 1 promotions) down to 18 KB (Gen 0 only).
+
+## 7. Deterministic Cleanup: IDisposable, IAsyncDisposable, and SafeHandle
+
+### What It Is & Why It Exists
+The GC manages *managed memory*, **not** *unmanaged resources* such as OS file handles, network sockets, PostgreSQL connections, native memory pointers, or timers. Waiting for an eventual GC cycle to release a database connection or file lock would exhaust connection pools and lock files indefinitely.
+
+`IDisposable` (synchronous) and `IAsyncDisposable` (asynchronous, introduced in C# 8) provide **deterministic cleanup**: resources are released the instant your scope finishes, even if an exception occurs.
+
+### How It Works
+
+#### The `using` Block and `using` Declaration
+Both compile down to a `try { ... } finally { resource?.Dispose(); }` block:
+```csharp
+// Classic using block (explicit scope)
+using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+{
+    await CallExternalApiAsync(cts.Token);
+} // cts.Dispose() runs here
+
+// Modern C# 8+ using declaration (disposes at end of enclosing scope)
+using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+```
+
+#### The Full `IDisposable` Pattern (When Owning Unmanaged or Disposable State)
+When a class owns disposable fields—or wraps a raw unmanaged handle—implement the full pattern so cleanup is idempotent (safe to call `Dispose()` twice), throws `ObjectDisposedException` after disposal if appropriate, and suppresses unnecessary finalization:
+```csharp
+public class ManagedResourceHolder : IDisposable
+{
+    private readonly MemoryStream _buffer = new();
+    private bool _disposed;
+
+    public void WriteBytes(ReadOnlySpan<byte> data)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _buffer.Write(data);
+    }
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed) return;
+
+        if (disposing)
+        {
+            // Dispose managed IDisposable fields ONLY when disposing == true
+            _buffer.Dispose();
+        }
+
+        // Release any raw unmanaged resources here (rare; prefer SafeHandle)
+        _disposed = true;
+    }
+}
+```
+> [!TIP]
+> If your class is `sealed` and holds **only** managed `IDisposable` fields (no raw `IntPtr` handles and no finalizer), you do **not** need `protected virtual void Dispose(bool)` or `GC.SuppressFinalize(this)`. Simply implement `public void Dispose()`, guard with `_disposed`, and dispose your fields!
+
+#### `IAsyncDisposable` and `await using`
+When releasing a resource requires asynchronous I/O (such as flushing an `NpgsqlConnection`, flushing a buffered `Stream` / `Utf8JsonWriter`, or closing a SignalR hub connection), blocking the thread in synchronous `Dispose()` risks thread-pool starvation and deadlocks. Implement `IAsyncDisposable`:
+```csharp
+await using var scope = scopeFactory.CreateAsyncScope();
+var dbContext = scope.ServiceProvider.GetRequiredService<DocumentsDbContext>();
+// dbContext.DisposeAsync() is awaited cleanly at the end of the scope
+```
+If a type implements *both* `IDisposable` and `IAsyncDisposable` (like `Stream` or `DbContext`), override `DisposeAsyncCore()` to share async cleanup logic cleanly.
+
+#### `SafeHandle`: The Modern Replacement for Raw `IntPtr`
+Never store a raw OS handle (`IntPtr` / `nint`) and write a custom finalizer yourself. Wrap it in a subclass of `System.Runtime.InteropServices.SafeHandle` (such as `SafeFileHandle`). `SafeHandle` inherits from `CriticalFinalizerObject`, preventing handle recycling attacks and guaranteeing the CLR executes handle release reliably even under severe runtime stress.
+
+#### DI Lifetimes & Ownership Rule
+- **Who creates it, disposes it**: If the ASP.NET Core DI container injected `DocumentsDbContext`, `HttpClient`, or `ITextEmbeddingService` into your handler's primary constructor, **the DI container owns its lifetime** and disposes it when the HTTP request scope ends. Never call `.Dispose()` on injected services inside a handler!
+- **Background Workers (`Normora.Worker`)**: Hangfire jobs and `BackgroundService` loops sit outside HTTP request scopes, so they must explicitly create and `await using` an `AsyncServiceScope` via `IServiceScopeFactory.CreateAsyncScope()`.
+
+```mermaid
+flowchart TD
+    Req["HTTP Request or Hangfire Job"] -->|"Creates scope"| Scope["IServiceScope / AsyncServiceScope"]
+    Scope -->|"Resolves"| Db["DocumentsDbContext (Scoped IAsyncDisposable)"]
+    Scope -->|"Resolves"| Minio["MinioDocumentStorageService"]
+    Minio -->|"Opens per-call"| Stream["Document Stream (Method-owned await using)"]
+    Stream -->|"Method finishes"| S_Disp["Stream.DisposeAsync() called immediately"]
+    Scope -->|"Request or Job finishes"| Sc_Disp["Scope disposed: DbContext.DisposeAsync()"]
+    Sc_Disp -->|"Memory only left"| GC["GC reclaims managed wrappers in Gen 0"]
+```
+
+### When NOT to Implement `IDisposable`
+- **Do NOT** implement `IDisposable` on pure domain entities (`Tenant`, `Document`, `DocumentChunk`), CQRS commands/queries (`UploadDocumentCommand`), or DTOs just to "help the GC clear fields." `IDisposable` has zero effect on managed memory reclamation—it only releases unmanaged/disposable resources.
+- **Do NOT** manually `Dispose()` an `HttpClient` created by `IHttpClientFactory` in a tight loop—doing so wastes pooled sockets or breaks handler rotation; let `IHttpClientFactory` manage `HttpMessageHandler` lifetimes (while still disposing each `HttpResponseMessage`!).
+
+### Real-World Normora Examples (`IDisposable` & `IAsyncDisposable`)
+1. **MinIO Streaming Download (`MinioDocumentStorageService`)**: When `Normora.Worker` pulls an uploaded PDF from MinIO for OCR/text extraction, the returned `Stream` holds an open HTTP response socket and buffer; wrapping it in `await using var docStream = await storageService.OpenReadAsync(...)` releases the socket immediately after extraction finishes.
+2. **Hangfire Scope Isolation (`HangfireDocumentProcessingOutboxDispatcher`)**: Because `Normora.Worker` processes outbox messages outside an HTTP pipeline, it creates `await using var scope = scopeFactory.CreateAsyncScope();` per job so `DocumentsDbContext` and its `NpgsqlConnection` are asynchronously returned to the connection pool immediately after the job completes.
+3. **Linked Timeout Tokens (`GeminiEmbeddingService`)**: Creating `using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct); timeoutCts.CancelAfter(TimeSpan.FromSeconds(30));` registers internal timer queue callbacks. Disposing `timeoutCts` guarantees those timer registrations don't linger until timeout expiry.
+4. **Streaming SSE Payloads (`Conversations` AG-UI / SSE Endpoint)**: Writing streamed tokens and A2UI JSON cards with `await using var writer = new Utf8JsonWriter(responseBodyStream);` flushes buffered UTF-8 bytes asynchronously without blocking Kestrel thread-pool threads.
+5. **When NOT to Implement `IDisposable` (`UploadDocumentCommand` & `Document`)**: `UploadDocumentCommand`, `Document`, and `TenantMembership` hold only managed strings, `Guid`s, and collections. Implementing `IDisposable` on them adds pointless boilerplate and misleads callers into wrapping domain models in `using` statements.
+
+## 8. Finalizers, the Finalization Queue, and Weak References
+
+### What It Is & Why It Exists
+What if a developer constructs an object holding a raw OS handle and forgets to wrap it in a `using` statement? The handle would leak forever. To provide a last-resort safety net, C# supports **Finalizers** (syntax: `~ClassName()`).
+
+Additionally, when you need to attach metadata to objects or inspect cached instances *without* creating a strong GC Root that keeps them alive forever, .NET provides **`WeakReference<T>`** and **`ConditionalWeakTable<TKey, TValue>`**.
+
+### How It Works
+
+#### Fixed `NetworkStreamReader`: Finalizer + Full Dispose Pattern
+*(Note: In real code, prefer `Socket` directly or `SafeHandle` rather than writing a custom finalizer.)*
 ```csharp
 public class NetworkStreamReader : IDisposable
 {
-    private Socket _socket;
+    private Socket? _socket;
+    private bool _disposed;
 
     public NetworkStreamReader()
     {
         _socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
     }
 
-    public void ReadData() { /* ... */ }
+    public void ReadData()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        // ... read from _socket ...
+    }
 
-    // Required by IDisposable
     public void Dispose()
     {
-        _socket?.Close();
-        _socket?.Dispose();
+        Dispose(disposing: true);
+        // Tell the GC: we already cleaned up, do NOT run ~NetworkStreamReader()
+        GC.SuppressFinalize(this);
     }
-}
-```
 
-**The `using` Statement:**
-To ensure `Dispose` is called even if an exception is thrown, C# provides the `using` keyword. It compiles into a `try/finally` block.
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_disposed) return;
 
-```csharp
-// Modern C# 8+ using declaration
-using var reader = new NetworkStreamReader();
-reader.ReadData();
-// reader.Dispose() is automatically called at the end of the method scope.
-```
+        if (disposing)
+        {
+            // Managed disposable resources can be safely touched here
+            _socket?.Dispose();
+            _socket = null;
+        }
 
-## 7. Finalizers and the Finalization Queue
+        // Release raw unmanaged handles (if any) when disposing == false too
+        _disposed = true;
+    }
 
-What if a developer forgets to wrap `NetworkStreamReader` in a `using` statement? The socket handle would leak forever.
-To provide a safety net, C# allows you to write a **Finalizer** (a method preceded by a tilde `~`).
-
-```csharp
-public class NetworkStreamReader : IDisposable
-{
-    private Socket _socket;
-    
-    // ... Constructor and Dispose ...
-
-    // Finalizer (Destructor)
+    // Finalizer (Destructor) — safety net if caller forgot Dispose()
     ~NetworkStreamReader()
     {
-        Dispose(false); // Clean up unmanaged resources
+        Dispose(disposing: false);
     }
 }
 ```
 
-**The Hidden Cost of Finalizers:**
-If an object has a finalizer, the GC handles it very differently:
-1. When the object is created, a reference is added to the **Finalization Queue**.
-2. When the GC determines the object is dead, it *does not* reclaim its memory. Instead, it moves it to the **Freachable Queue**.
-3. A dedicated, high-priority CLR thread reads the Freachable Queue and executes the `~Finalizer()` methods.
-4. The object survives into the next GC generation (usually Gen 1 or Gen 2). Its memory is finally reclaimed on the *next* GC cycle.
+#### The Hidden Cost of Finalizers (Finalization Queue vs. Freachable Queue)
+If an object has a finalizer (and `GC.SuppressFinalize(this)` was **not** called), the GC handles it very differently:
+1. **Creation**: When the object is allocated, a pointer to it is added to the **Finalization Queue**.
+2. **GC Cycle 1 (Unreachable)**: When the GC marks live objects and finds this object unreachable, it scans the Finalization Queue. Seeing the object is unmarked, it *cannot* reclaim its memory yet—it moves the pointer from the Finalization Queue to the **Freachable Queue** and marks the object (and everything it references!) as live. **The object just survived into Gen 1 or Gen 2!**
+3. **Finalizer Thread**: A dedicated CLR finalizer thread drains the Freachable Queue and runs each `~Finalizer()`.
+4. **GC Cycle 2**: Only on a *subsequent* GC cycle (in that higher generation!) is the object finally unreachable and reclaimed.
 
-**Architectural Rule:** Finalizers delay memory reclamation and promote short-lived objects to older generations. Implement them *only* as a fallback for objects holding raw OS handles (which is rare, as you should use `SafeHandle` classes from the BCL).
+```mermaid
+sequenceDiagram
+    participant App as "Application Code"
+    participant Heap as "Managed Heap (Gen 0)"
+    participant FQ as "Finalization Queue"
+    participant FRQ as "Freachable Queue"
+    participant Fin as "CLR Finalizer Thread"
 
-## 8. Real Production Case Study: Object Pooling
+    App->>Heap: "new FinalizableResource()"
+    Heap->>FQ: "Register pointer at allocation"
+    alt "Caller calls Dispose()"
+        App->>Heap: "Dispose() -> GC.SuppressFinalize(this)"
+        Heap-->>FQ: "Unregister flag set; reclaimed in Gen 0!"
+    else "Caller forgets Dispose()"
+        Note over Heap,FQ: "GC #1 runs: object is unreachable"
+        FQ->>FRQ: "Move to Freachable Queue (Object promoted to Gen 1!)"
+        FRQ->>Fin: "Dedicated thread executes ~Finalizer()"
+        Note over Heap: "GC #2 (Gen 1/2) finally reclaims memory"
+    end
+```
+
+#### Resurrection and `GC.KeepAlive`
+- **Resurrection**: If a finalizer assigns `this` to a `static` field (`_graveyard = this`), the object becomes reachable again ("resurrected")—along with its partially disposed fields! Never do this.
+- **`GC.KeepAlive(obj)`**: Because the JIT can end an object's lifetime after its *last read* in a method (even before the method returns), if you extract a raw `IntPtr` from a wrapper object and pass that handle to a native C function, the GC could finalize the wrapper *while the native call is running*! Calling `GC.KeepAlive(wrapper)` after the native call prevents premature collection. (Using `SafeHandle` solves this automatically.)
+
+#### `WeakReference<T>` and `ConditionalWeakTable<TKey, TValue>`
+- **`WeakReference<T>`**: Holds a reference that does *not* count as a GC Root. If memory is available and no GC has collected the target, `TryGetTarget(out T? target)` succeeds; once collected, it returns `false`.
+- **`ConditionalWeakTable<TKey, TValue>`**: A thread-safe dictionary whose keys are held weakly. Unlike `Dictionary<object, T>` (which leaks forever unless keys are manually removed), when a key object is collected by the GC, its entry is automatically purged from the table. (Note: `TValue` must not hold a strong reference back to `TKey`, or neither can ever be collected!)
+
+### When NOT to Use Finalizers or `WeakReference<T>`
+- **Do NOT** write a finalizer on any class that holds only managed objects (such as `DbContext`, `List<T>`, or `HttpClient`). By the time a finalizer runs, managed fields may already be finalized in arbitrary order!
+- **Do NOT** use `WeakReference<T>` as a general application cache—the GC collects weak references unpredictably on every Gen 0/1/2 cycle depending on target generation, causing erratic cache hit rates. Use `IMemoryCache` / `HybridCache` (with explicit expiration & `SizeLimit`) or Redis instead.
+
+### Real-World Normora Examples (Finalizers & Weak References)
+1. **`SafeHandle` in Native PDF/OCR Extraction**: If `Normora.Infrastructure/Providers/DocumentExtraction` wraps a native C++ PDFium/Tesseract library handle, wrapping that pointer in a `SafeHandle` guarantees OS handle cleanup without fragile custom finalizers or `GC.KeepAlive` bugs.
+2. **Why Domain Entities & `DbContext` Have No Finalizers**: `DocumentsDbContext`, `Document`, and `DocumentProcessingOutboxMessage` intentionally omit finalizers. `DocumentsDbContext` relies on `IDisposable`/`IAsyncDisposable` via DI scoping rather than delaying Gen 0/1 cleanup onto the Freachable Queue.
+3. **Finalizer-Free `CancellationTokenSource` Usage**: Although `CancellationTokenSource` implements `IDisposable`, it does not define a finalizer—forgetting to dispose a linked or timed `CancellationTokenSource` in a Normora retry policy keeps it rooted by the internal CLR `TimerQueue` until the timeout fires!
+4. **Out-of-Band Diagnostic Telemetry (`ConditionalWeakTable<Document, IngestionTimingTrace>`)**: Attaching temporary ingestion timing metadata to in-flight `Document` objects in `Normora.Worker` via `ConditionalWeakTable` avoids polluting the `Document` domain entity with infrastructure properties and automatically drops entries as soon as each `Document` is collected.
+5. **Why `TenantResolutionMiddleware` Avoids `WeakReference<T>`**: Tenant slug and RBAC membership lookups in `Normora.Api` require predictable 30-second–5-minute TTLs and instant revocation across instances—so Normora uses **Redis distributed caching** (`IDistributedCache` / `HybridCache`), never `WeakReference<T>`.
+
+## 9. Production Case Studies: Object Pooling and Low-Allocation Patterns
+
+### What It Is & Why It Exists
+When a high-throughput service allocates temporary buffers or builders thousands of times per second, even Gen 0 collections—or worse, LOH allocations—consume measurable CPU and cause latency jitter. **Pooling** (`ArrayPool<T>`, `ObjectPool<T>`) and **stack/writer primitives** (`stackalloc`, `ArrayBufferWriter<byte>`) let you reuse memory across operations so allocation rate drops near zero.
+
+### When NOT to Pool
+- **Do NOT** pool tiny short-lived classes (< a few hundred bytes) that have no internal buffers; Gen 0 TLAB allocation is faster than pool locking/returning.
+- **Do NOT** pool arrays containing sensitive multi-tenant PII, JWTs, or document text **without passing `clearArray: true`** when returning them! Otherwise, Tenant B could accidentally read stale bytes left by Tenant A if a slice bounds bug occurs.
+
+### Case Study A (EV Telemetry): `ArrayPool<byte>` for High-Frequency Socket Parsing
 
 In our EV Platform, we parse incoming heartbeat messages. If we allocate a new `byte[]` buffer for every incoming TCP packet, we will generate massive Gen 0 pressure. If those packets arrive faster than the GC can collect them, they will be promoted to Gen 1 and Gen 2, eventually causing a Full GC pause that drops network connections.
 
 **Solution: `ArrayPool<T>`**
-Instead of allocating and discarding, we will rent arrays from a shared pool.
+Instead of allocating and discarding, we rent arrays from a shared pool:
 
 ```csharp
 using System.Buffers;
@@ -151,33 +415,38 @@ public class HeartbeatListener
 {
     private readonly Socket _listenSocket;
 
+    public HeartbeatListener(Socket listenSocket)
+    {
+        _listenSocket = listenSocket;
+    }
+
     public async Task ListenAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             var clientSocket = await _listenSocket.AcceptAsync(ct);
-            _ = ProcessClientAsync(clientSocket); // Fire and forget
+            _ = ProcessClientAsync(clientSocket, ct);
         }
     }
 
-    private async Task ProcessClientAsync(Socket client)
+    private async Task ProcessClientAsync(Socket client, CancellationToken ct)
     {
-        // RENT a buffer instead of allocating a new one
-        // The array returned might be larger than 1024 bytes!
+        // RENT a buffer instead of allocating a new one.
+        // IMPORTANT: The array returned may be LARGER than 1024 bytes!
         byte[] buffer = ArrayPool<byte>.Shared.Rent(1024);
-        
+
         try
         {
-            int bytesRead = await client.ReceiveAsync(buffer, SocketFlags.None);
-            
-            // Slice the buffer to the actual bytes read using Span
+            int bytesRead = await client.ReceiveAsync(buffer.AsMemory(), SocketFlags.None, ct);
+
+            // Slice the buffer to the exact bytes read using Span
             ReadOnlySpan<byte> actualData = buffer.AsSpan(0, bytesRead);
             ParseHeartbeat(actualData);
         }
         finally
         {
-            // RETURN the buffer to the pool so another thread can use it.
-            // If you forget this, the pool eventually allocates new arrays (memory leak).
+            // RETURN the buffer to the pool so another thread can reuse it.
+            // Forgetting this leaks buffers and forces the pool to allocate new arrays.
             ArrayPool<byte>.Shared.Return(buffer);
             client.Dispose();
         }
@@ -186,6 +455,13 @@ public class HeartbeatListener
     private void ParseHeartbeat(ReadOnlySpan<byte> data) { /* ... */ }
 }
 ```
+
+### Case Study B (Normora): Multi-Tenant Pooling & Zero-Allocation Patterns
+1. **Multi-Tenant Safe Hashing & MinIO Upload Buffering (`ArrayPool<byte>` + `clearArray: true`)**: When `UploadDocumentCommandHandler` streams an uploaded file to compute its SHA-256 hash before dispatching to `MinioDocumentStorageService`, renting a 64 KB buffer from `ArrayPool<byte>.Shared.Rent(65_536)` avoids LOH allocations—and returning it via `ArrayPool<byte>.Shared.Return(buffer, clearArray: true)` zeroes the buffer so Tenant A's confidential document bytes never linger in the pool for Tenant B.
+2. **Markdown Breadcrumb & Prompt Assembly (`ObjectPool<StringBuilder>`)**: `DocumentChunker` prepends `# > ## > ###` section breadcrumbs across thousands of chunks per document, and `ConversationTurnPreparer` assembles multi-chunk RAG prompts. Using `Microsoft.Extensions.ObjectPool.ObjectPool<StringBuilder>` (via `StringBuilderPooledObjectPolicy`) reuses internal `char[]` buffers instead of creating throwaway `StringBuilder` allocations on every chunk.
+3. **Streaming Batch Embedding Payloads (`ArrayBufferWriter<byte>` + `Utf8JsonWriter`)**: When `GeminiEmbeddingService` serializes 100 chunks for `batchEmbedContents`, writing UTF-8 JSON directly into a pooled `ArrayBufferWriter<byte>` avoids building a massive intermediate UTF-16 `string` on the LOH before sending the `HttpContent`.
+4. **PayU HMAC Signature Verification (`stackalloc Span<byte>`)**: In `PayUPaymentService`, verifying webhook SHA-512 signatures requires fixed small byte buffers (64 bytes for SHA-512 digest). Using `Span<byte> hashBuffer = stackalloc byte[64];` allocates **zero bytes** on the managed heap and triggers zero GC work.
+5. **Hybrid Search RRF Reranking (`ArrayPool<float>`)**: When computing Reciprocal Rank Fusion scores across hundreds of candidate chunks returned from `pgvector` and full-text search, renting temporary score arrays from `ArrayPool<float>.Shared` keeps hot retrieval paths completely out of Gen 1/Gen 2.
 
 ## 9. Common Mistakes
 

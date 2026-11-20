@@ -2,34 +2,47 @@
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
-- Understand the architecture of RESTful APIs and HTTP semantics.
-- Define HTTP endpoints using ASP.NET Core Minimal APIs.
-- Extract data from the HTTP Request (Route parameters, Query Strings, and JSON Bodies).
-- Serialize C# objects to JSON Responses automatically.
-- Return appropriate HTTP Status Codes using the `IResult` interface.
+- Understand the architecture of RESTful APIs, HTTP request/response anatomy, status code semantics (`1xx`–`5xx`), safety, idempotency, and when **not** to use synchronous REST.
+- Define HTTP endpoints using both **ASP.NET Core Minimal APIs** (with Route Groups and Route Constraints) and **Attribute-Routed `[ApiController]` classes** (Normora's modular monolith pattern).
+- Extract and validate data from HTTP requests using **Model Binding** (Route, Query, JSON Body, Headers, `[AsParameters]`, `IFormFile` streaming, and `CancellationToken`), **`System.Text.Json`**, **FluentValidation**, and **RFC 9457 Problem Details**.
+- Return compile-time safe, OpenAPI-friendly HTTP responses using **`TypedResults`**, **`IResult`**, **Server-Sent Events (SSE)** in .NET 10, and Normora's BOLA (`404`) / BFLA (`403`) security envelopes.
+- Configure **OpenAPI + Scalar** documentation, fail-fast **`IOptions<T>`** configuration, and endpoint-level security fundamentals (Authorization, CORS, Rate Limiting, and Duende BFF endpoints).
 
 ## 2. Introduction
 
-In previous chapters, we focused on how C# code runs on the CPU and interacts with memory. But an enterprise application does not exist in a vacuum. It must communicate with external systems—mobile apps, single-page web applications (React/Angular), and third-party servers.
+In previous chapters, we focused on how C# code runs on the CPU, manages memory, and coordinates asynchronous and concurrent work. But an enterprise application does not exist in a vacuum. It must communicate with external systems—mobile apps, single-page web applications (such as Normora's Angular 22 SPA), background workers, and AI agent clients.
 
-The universal language of modern distributed systems is **HTTP (Hypertext Transfer Protocol)**. 
-**ASP.NET Core** is the web framework built into .NET that allows you to easily map incoming HTTP requests over the network to specific C# methods in your application.
+The universal language of modern distributed systems is **HTTP (Hypertext Transfer Protocol)**—a stateless request/response protocol layered over TCP (or QUIC for HTTP/3).
+**ASP.NET Core** is the cross-platform, high-performance web framework built into .NET 10 that maps incoming HTTP requests over the network to strongly-typed C# methods in your application.
 
-Before we dive into the extreme performance internals of Kestrel and the Middleware pipeline in the next chapter, we must first master the basics: How do we expose our C# logic to the internet?
+In Normora, ASP.NET Core serves two complementary roles at the HTTP boundary:
+1. **`Normora.Api` (The Host & BFF)**: Hosts the Duende Backend-For-Frontend (BFF) cookie session pipeline, OpenAPI/Scalar documentation (`/scalar/v1`), SignalR hubs, and AG-UI/Minimal API host endpoints.
+2. **Decentralized Module Controllers (`Modules/*/API/*Controller.cs`)**: Each bounded context (`Tenants`, `Documents`, `Conversations`) owns its own `[ApiController]` classes and delegates work to MediatR CQRS handlers.
 
-## 3. RESTful API Design and HTTP Verbs
+Before we dive into the extreme performance internals of Kestrel, the Middleware pipeline, and Dependency Injection lifetimes in Chapter 12, we must master the HTTP surface: How do we cleanly, safely, and predictably expose our C# logic to the web?
 
-Most modern web services follow **REST (Representational State Transfer)** principles. In REST, everything is treated as a "Resource" (e.g., a Charger, a Tenant, an Invoice).
+## 3. RESTful API Design and HTTP Semantics
 
-Clients interact with these resources using standard HTTP Methods (Verbs):
-- **GET:** Retrieve a resource (Read-only, idempotent).
-- **POST:** Create a new resource.
-- **PUT:** Completely replace an existing resource.
-- **PATCH:** Partially update an existing resource.
-- **DELETE:** Remove a resource.
+Most modern web services follow **REST (Representational State Transfer)** principles—an architectural style where server capabilities are modeled as **Resources** (such as a `Tenant`, a `Document`, a `DocumentChunk`, a `Conversation`, or an EV `Charger`) identified by **URIs (Uniform Resource Identifiers)** and manipulated through a uniform set of HTTP verbs.
 
-### The Anatomy of an HTTP Request
-When a client (like Postman or a web browser) sends a request to your server, it sends raw text that looks like this:
+### HTTP Verbs, Safety, and Idempotency
+Two critical architectural properties distinguish HTTP methods:
+- **Safe**: Calling the method does not modify server state (aside from logging/metrics). Safe methods can be cached and prefetched safely.
+- **Idempotent**: Calling the method once or ten times in a row with the same inputs leaves the server in the exact same state (even if the response status code differs, e.g., `200` then `404` on `DELETE`). Idempotency is vital because networks drop packets and clients retry!
+
+| Method | Purpose | Safe? | Idempotent? | Typical Success Status |
+|---|---|---|---|---|
+| **GET** | Retrieve a resource or collection | Yes | Yes | `200 OK` |
+| **HEAD** | Retrieve response headers without a body (e.g., check existence/size) | Yes | Yes | `200 OK` / `204 No Content` |
+| **POST** | Create a new resource or trigger a non-idempotent action | No | No | `201 Created` / `202 Accepted` / `200 OK` |
+| **PUT** | Completely replace an existing resource (or upsert at a known URI) | No | Yes | `200 OK` / `204 No Content` |
+| **PATCH** | Partially update specific fields of an existing resource | No | Usually No* | `200 OK` / `204 No Content` |
+| **DELETE** | Remove (or soft-delete) a resource | No | Yes | `204 No Content` / `200 OK` |
+
+*\*Note: A `PATCH` that sets `{ "status": "Archived" }` is idempotent, whereas `{ "incrementRetryCount": 1 }` is not.*
+
+### The Anatomy of an HTTP Request and Response
+When a client (like Postman, `curl`, or a web browser) sends a request to your server, it sends structured text over the wire:
 
 ```http
 POST /api/chargers HTTP/1.1
@@ -43,7 +56,50 @@ Authorization: Bearer xyz123
 }
 ```
 
-Your job as an ASP.NET Core developer is to configure the framework to listen for this text, extract the JSON, map it to a C# object, run your business logic, and return an HTTP Response.
+Every HTTP message consists of three parts:
+1. **Start Line**: Method + Path + HTTP version in a request (`POST /api/chargers HTTP/1.1`), or Version + Status Code + Reason Phrase in a response (`HTTP/1.1 201 Created`).
+2. **Headers**: Key-value metadata such as `Content-Type` (format of the body being sent), `Accept` (format the client wants back—used in **Content Negotiation**), `Authorization` (credentials), or `Cookie` (used by Normora's Duende BFF).
+3. **Body (Payload)**: Optional bytes (usually JSON, form data, or binary file streams). `GET`, `HEAD`, and `DELETE` requests conventionally do not send a body.
+
+### HTTP Status Code Families
+ASP.NET Core communicates outcomes using standardized 3-digit status codes:
+- **`2xx` (Success)**: `200 OK` (data returned), `201 Created` (new resource created + `Location` header), `202 Accepted` (queued for background processing, e.g., Hangfire), `204 No Content` (succeeded, intentionally empty body).
+- **`3xx` (Redirection)**: `302 Found` / `307 Temporary Redirect` (OIDC login redirects to Keycloak), `304 Not Modified` (cached resource unchanged).
+- **`4xx` (Client Error)**:
+  - `400 Bad Request` — Malformed JSON or failed validation (`ValidationProblem`).
+  - `401 Unauthorized` — Literally means **Unauthenticated**: the client has no valid session cookie or token ("I don't know who you are").
+  - `403 Forbidden` — **Authenticated, but unauthorized** ("I know who you are, but you lack the role/permission"). In Normora, this maps to **BFLA (Broken Function Level Authorization)**.
+  - `404 Not Found` — Resource does not exist—or in Normora's **BOLA (Broken Object Level Authorization)** defense, the resource exists in another tenant/department and must not be revealed.
+  - `409 Conflict` — State conflict (e.g., duplicate department slug or concurrent edit conflict).
+  - `429 Too Many Requests` — Rate limit exceeded.
+- **`5xx` (Server Error)**: `500 Internal Server Error` (unhandled bug), `502 Bad Gateway` / `503 Service Unavailable` (downstream dependency like PostgreSQL or Gemini unavailable).
+
+### When NOT to Use Synchronous REST Endpoints
+A senior architect knows when standard request/response REST is the wrong tool:
+- **Long-Running Workflows (seconds to minutes)**: Parsing a 150-page PDF, chunking it, and generating Gemini vector embeddings must **not** block an HTTP request. Return `202 Accepted`, commit a transactional outbox message, process in `Normora.Worker` (Hangfire), and notify via SignalR.
+- **One-Way Token Streaming**: Streaming an AI response token-by-token is a poor fit for standard buffered JSON responses; use **Server-Sent Events (SSE)** (`TypedResults.ServerSentEvents`) or SignalR.
+- **Internal Cross-Module Calls in a Modular Monolith**: `Conversations` must **not** make HTTP loopback calls to `Documents` over localhost; use in-process MediatR contracts (`PerformHybridRetrievalQuery`).
+- **High-Throughput Internal Binary RPC**: For chatty microservice-to-microservice calls with strict latency/bandwidth budgets, prefer **gRPC** (HTTP/2 + Protobuf) over JSON/REST.
+
+```mermaid
+flowchart LR
+    Client["Angular 22 SPA / Client"] -->|"HTTP Request"| Decide{"Interaction Pattern?"}
+    Decide -->|"Fast CRUD / Query"| Rest["REST Endpoint: 200 / 201 / 204"]
+    Decide -->|"Slow Ingestion (PDF + Embeddings)"| Outbox["202 Accepted + Outbox + Hangfire"]
+    Decide -->|"Live AI Token Stream"| SSE["SSE Stream (text/event-stream)"]
+    Decide -->|"Multi-Host Push Notification"| SignalR["SignalR Hub + Redis Backplane"]
+    Outbox -->|"Completion Event"| SignalR
+```
+
+### Real-World Normora HTTP Design Examples
+1. **Read Document Metadata (`GET`)**: `GET /api/documents/{documentId}` is safe and idempotent. It returns `200 OK` with a `DocumentDetailsDto`, or `404 Not Found` (`BolaException`) if the document belongs to another tenant or restricted department.
+2. **Upload Policy Document (`POST` + Async Outbox)**: `POST /api/documents/upload` is non-idempotent. It validates the file, streams bytes to MinIO, saves `Document` + `DocumentProcessingOutboxMessage` atomically, and returns `202 Accepted` with the new document ID so the UI can track ingestion progress.
+3. **Update Workspace Currency (`PUT`)**: `PUT /api/subscription/currency` replaces `TenantPlan.Currency` (e.g., `"USD"` -> `"INR"`). Calling it twice with `"INR"` yields the exact same billing state (idempotent) and returns `204 No Content`.
+4. **Update Workspace Branding (`PATCH`)**: `PATCH /api/tenants/branding` updates only supplied visual fields (e.g., primary hex color or display name) without wiping the existing logo URL.
+5. **Delete Department (`DELETE`)**: `DELETE /api/tenants/departments/{departmentId}` requires workspace admin RBAC (otherwise `403 Forbidden` via `BflaException`). Deleting an already-deleted department does not create side effects (idempotent) and returns `204 No Content` (or `404` if hidden/absent).
+6. **Idempotent Conversation Turn (`POST` + Idempotency Key)**: `POST /api/conversations/{conversationId}/messages` accepts an `X-Idempotency-Key` header so mobile/browser retries after a transient Wi-Fi drop do not duplicate the user prompt or re-trigger Gemini tool executions.
+
+Your job as an ASP.NET Core developer is to configure the framework to listen for these HTTP messages, extract and validate the inputs, execute your domain logic, and return accurate, secure HTTP responses.
 
 ## 4. Routing and Minimal APIs
 

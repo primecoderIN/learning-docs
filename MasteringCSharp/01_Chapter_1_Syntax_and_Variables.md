@@ -1,24 +1,27 @@
-# Chapter 1: C# Syntax, Variables, and Control Flow
+# Chapter 1: C# 14 Syntax, Variables, and Control Flow
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
-- Structure a modern C# application using Top-Level Statements.
-- Declare variables and understand the underlying type system.
-- Understand exactly how the `var` keyword is processed by the Roslyn compiler.
-- Write robust expressions and statements.
-- Implement control flow and understand how `switch` statements compile into optimized IL jump tables.
+- Structure a modern C# 14 / .NET 10 application using Top-Level Statements, file-scoped namespaces, and `global using` directives.
+- Choose the right primitive, numeric, temporal, and identifier types (`decimal`, `Guid`, `DateTimeOffset`, `TimeSpan`) for enterprise domains.
+- Explain how the Roslyn compiler processes `var`, target-typed `new()`, `const`, `readonly`, and `checked`/`unchecked` arithmetic.
+- Write allocation-aware string code using interpolation handlers, raw string literals, `nameof`, and culture-invariant comparisons.
+- Prevent `NullReferenceException` bugs using Nullable Reference Types (NRTs), null-coalescing/conditional operators (including C# 14 `?.=`), and guard clauses.
+- Write clean expressions, pattern-matching `switch` expressions, loops, and `using` declarations, and understand how `switch` compiles into IL jump tables and string-hash dispatch.
 
 ## 2. Introduction
 
-Every software architect must start at the foundation. While C# is an incredibly deep and powerful language, its syntax is designed to be accessible, sharing a lineage with C, C++, and Java. 
+Every software architect must start at the foundation. While C# is a deep and expressive language, its syntax is designed to be approachable, sharing a lineage with C, C++, and Java.
 
-However, in this book, we do not settle for "just getting it to work." Even the most basic features of C#—like declaring a variable or writing a loop—have profound implications on how the compiler generates Intermediate Language (IL) and how the runtime executes your code.
+However, in this course we do not settle for "just getting it to work." Even the most basic features of C# 14 on .NET 10—like declaring a variable, formatting a string, checking for `null`, or writing a `switch`—have profound implications for how **Roslyn** (Microsoft's open-source C# compiler) generates **Intermediate Language (IL)** (the CPU-independent bytecode stored inside `.dll` assemblies) and how the **Common Language Runtime (CLR)** (the .NET execution engine that compiles IL to machine code and manages memory) executes your program.
 
-In this chapter, we will build the first component of our **Multi-Tenant EV Charging Platform**: a Command Line Interface (CLI) tool used by administrators to configure new chargers. Through this practical example, we will master the foundational syntax of C#.
+Throughout this course, we anchor every concept in **Normora**, an enterprise multi-tenant knowledge management and conversational-AI platform built as a **.NET 10 Modular Monolith** (an architecture where distinct business domains—`Tenants`, `Documents`, and `Conversations`—run in one deployable backend while keeping strict internal code and database boundaries). Normora uses **CQRS** (Command Query Responsibility Segregation, separating write operations called *Commands* from read operations called *Queries*), PostgreSQL with `pgvector` for semantic search, MinIO for object storage, Google Gemini for embeddings and chat, Keycloak **OIDC** (OpenID Connect, an identity layer for login) behind a **Duende BFF** (Backend-for-Frontend, a server-side security proxy that keeps authentication tokens in encrypted `HttpOnly` cookies away from the browser), SignalR for real-time updates, and OpenTelemetry for observability. You will also see how **BOLA** (Broken Object Level Authorization, accessing another tenant's resource—mapped to HTTP `404 Not Found` via `BolaException`) and **BFLA** (Broken Function Level Authorization, calling an action without role permission—mapped to HTTP `403 Forbidden` via `BflaException`) start right at basic variable checks and control flow.
 
-## 3. Hello World: Modern C# Structure
+Along the way, we will also retain a standalone CLI walkthrough alongside Normora's real-world backend patterns so you can practice every foundational building block from first principles.
 
-Historically, a C# application required a significant amount of boilerplate code: a namespace, a class, and a static `Main` method. 
+## 3. Hello World: Modern C# Structure & Entry Points
+
+Historically, every C# executable required significant boilerplate: a `namespace` (a logical grouping that prevents type name collisions), a `class`, and a `static void Main` method serving as the program's entry point.
 
 ```csharp
 // Legacy C# Structure (C# 1.0 - 8.0)
@@ -36,91 +39,369 @@ namespace EVPlatform.Cli
 }
 ```
 
-Since C# 9.0, Microsoft introduced **Top-Level Statements**, eliminating the boilerplate. The compiler automatically generates the namespace, the `Program` class, and the `Main` method for you behind the scenes.
+### Top-Level Statements, File-Scoped Namespaces, and `global using`
+Since C# 9.0, **Top-Level Statements** let you omit the enclosing `Program` class and `Main` method in your entry-point file. C# 10 added **file-scoped namespaces** (`namespace Normora.Shared.Constants;`, eliminating one level of indentation across the whole file) and **`global using` directives** (plus `<ImplicitUsings>enable</ImplicitUsings>` in `.csproj` files, which automatically imports `System`, `System.Collections.Generic`, `System.Linq`, `System.Threading.Tasks`, and host-specific namespaces). In .NET 10, you can even run standalone single-file C# scripts directly from the terminal with `dotnet run script.cs`.
 
 ```csharp
-// Modern C# Structure (C# 9.0+)
-using System;
-
-Console.WriteLine("EV Platform Booting...");
+// Modern C# Structure (C# 9.0+ / .NET 10)
+Console.WriteLine("Normora Host Booting...");
 ```
 
-**What happens internally?**
-When the Roslyn compiler processes a file with Top-Level Statements, it dynamically emits a `<Program>$` class with a `<Main>$` method. This means you still have full access to command-line arguments via the implicit `args` array, but your code remains remarkably clean.
+- **What it is:** Compiler-synthesized entry-point boilerplate (`<Program>$` class and `<Main>$` method) combined with file-wide namespace declarations and shared imports.
+- **Why use it:** Reduces ceremony in startup files (`Normora.Api/Program.cs`, `Normora.Worker/Program.cs`), keeps attention on dependency injection and middleware wiring, and eliminates horizontal indentation drift across thousands of module files.
+- **How it works internally:** When Roslyn compiles a file containing Top-Level Statements, it emits an internal class named `<Program>$` with a `<Main>$` method (returning `void`, `int`, `Task`, or `Task<int>` depending on whether you `return` an exit code or use `await`). You automatically have access to the `args` string array parameter.
+- **When NOT to use it:**
+  - Never put Top-Level Statements in **class libraries** (like `Normora.Shared` or `Normora.Infrastructure`), because libraries do not have an entry point.
+  - Only **one** file per executable project can contain Top-Level Statements (putting them in two files causes compiler error `CS8802`).
+  - Avoid `global using` for obscure or conflicting namespaces (for instance, importing two libraries that both define a `Document` class creates ambiguity across every file in the project).
 
-## 4. Variables, Data Types, and the `var` Keyword
+```mermaid
+flowchart LR
+    A["Program.cs (Top-Level Statements + args)"] --> B["Roslyn Compiler"]
+    B --> C["Synthesized &lt;Program&gt;$ Class"]
+    C --> D["&lt;Main&gt;$(string[] args) or Task&lt;int&gt;"]
+    D --> E["CLR Execution & Exit Code"]
+```
 
-C# is a **statically-typed**, **strongly-typed** language. This means every variable must have a known type at compile-time, and you cannot accidentally assign a string to an integer variable.
+*(Note: In actual IL metadata, Roslyn names the generated type `<Program>$` and method `<Main>$` with angle brackets so user code cannot accidentally collide with them.)*
 
-### Basic Data Types
+### Real-World Normora Examples
 
-C# supports several primitive data types, which map directly to underlying .NET Base Class Library (BCL) types.
-
-| C# Keyword | .NET BCL Type | Size | Example Use Case |
-|------------|---------------|------|------------------|
-| `int`      | `System.Int32` | 32-bit | Loop counters, IDs |
-| `long`     | `System.Int64` | 64-bit | High-precision timestamps, large IDs |
-| `double`   | `System.Double`| 64-bit | Scientific calculations |
-| `decimal`  | `System.Decimal`| 128-bit| Financial calculations (Tariffs, Pricing) |
-| `bool`     | `System.Boolean`| 8-bit | True/False flags |
-| `char`     | `System.Char`  | 16-bit | Single Unicode character |
-| `string`   | `System.String`| Ref Type| Text data (e.g., "Charger-X1") |
-
-### Variable Declaration
-
-You declare a variable by specifying its type, its name, and optionally its initial value.
-
+**Example 1: `Normora.Api/Program.cs` — Ephemeral Migration Check via `args`**
+In Normora, running `dotnet Normora.Api.dll --migrate` must run database migrations in a lean console host without booting Kestrel (ASP.NET Core's web server) or SignalR hubs, avoiding container shutdown crashes.
 ```csharp
-int maxCurrentAmp = 32;
-decimal kwPrice = 0.45m; // The 'm' suffix specifies a decimal literal
-string chargerModel = "EV-Max-Pro";
-bool isOnline = true;
+// Normora.Api/Program.cs (top-level statements using implicit `args`)
+if (args.Contains("--migrate"))
+{
+    await MigrationHostExtensions.RunMigrationsAsync(args);
+    return 0;
+}
+
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+app.Run();
+return 0;
 ```
 
-### The Power of `var` (Compiler Type Inference)
-
-C# 3.0 introduced the `var` keyword. A common beginner mistake is assuming `var` makes C# dynamically typed like JavaScript or Python. **It does not.**
-
+**Example 2: `Normora.Worker/Program.cs` — Async Top-Level Host Startup**
+Because Top-Level Statements support `await`, Roslyn automatically upgrades `<Main>$` to return `Task` when the worker boots Hangfire background jobs.
 ```csharp
-var maxVoltage = 240; // The compiler infers 'int'
-var firmwareVersion = "v1.2.4"; // The compiler infers 'string'
+// Normora.Worker/Program.cs
+var builder = Host.CreateApplicationBuilder(args);
+builder.Services.AddNormoraInfrastructure(builder.Configuration);
+
+using var host = builder.Build();
+await host.RunAsync();
 ```
 
-When you use `var`, the Roslyn compiler inspects the right side of the assignment during the **Semantic Analysis** phase. It binds the type permanently. If you try to write `maxVoltage = "High";` on the next line, the compiler will throw an error (`CS0029: Cannot implicitly convert type 'string' to 'int'`).
+**Example 3: File-Scoped Namespace in `Normora.Shared/Constants/ApiMessages.cs`**
+Every class, record, and handler file inside Normora's modules (`Tenants`, `Documents`, `Conversations`) uses file-scoped namespaces to keep nesting shallow.
+```csharp
+namespace Normora.Shared.Constants;
 
-**Enterprise Best Practice:** Use `var` when the type is obvious from the right-hand side of the assignment (e.g., `var list = new List<string>();`). If the return type of a method is unclear, explicitly declare the type to improve code readability for your fellow engineers.
+public static class ApiMessages
+{
+    public const string TenantContextMissing = "Tenant context is missing.";
+    public const string NotFound = "The requested resource was not found.";
+    public const string Forbidden = "You do not have permission to perform this action.";
+}
+```
 
-## 5. Operators, Expressions, and Statements
+**Example 4: Module `GlobalUsings.cs` for Shared Abstractions**
+Inside `Normora.Modules.Documents`, a single `GlobalUsings.cs` shares common framework namespaces without polluting other modules.
+```csharp
+// server/Modules/Documents/GlobalUsings.cs
+global using MediatR;
+global using Normora.Shared.Constants;
+global using Normora.Shared.Exceptions;
+```
 
-An **expression** is code that evaluates to a value (e.g., `5 + 5`). A **statement** is a complete instruction executed by the program, usually ending in a semicolon (`;`).
+**Example 5: Exposing Compiler-Generated `Program` for Integration Tests**
+Because Top-Level Statements generate an internal `<Program>$` class by default, adding `public partial class Program { }` at the bottom of `Normora.Api/Program.cs` lets test suites reference `WebApplicationFactory<Program>`.
+```csharp
+app.Run();
 
-### Arithmetic and Relational Operators
-C# supports standard arithmetic (`+`, `-`, `*`, `/`, `%`) and relational (`==`, `!=`, `<`, `>`, `<=`, `>=`) operators.
+// Makes the compiler-generated Program type visible to Normora.Architecture.Tests
+public partial class Program { }
+```
+
+## 4. Variables, Data Types, Constants, and Type Inference
+
+C# is a **statically-typed**, **strongly-typed** language. Every variable has a fixed type verified at compile time, preventing accidental mismatches such as passing a tenant's slug (`string`) where a database primary key (`Guid`) is expected.
+
+### Core Data Types & Literals
+
+C# aliases map directly to types in the **.NET Base Class Library (BCL)** (the standard runtime library of built-in types and utilities). Beyond numeric primitives, enterprise backends rely heavily on `Guid`, `DateTimeOffset`, and `TimeSpan`.
+
+| C# Keyword / Type | .NET BCL Type | Size | Precision / Range | Normora Use Case |
+|---|---|---|---|---|
+| `byte` | `System.Byte` | 8-bit | `0` to `255` | Raw file headers, binary flags |
+| `int` | `System.Int32` | 32-bit | `-2.14B` to `+2.14B` | Chunk indexes, retry counters, HTTP status codes |
+| `long` | `System.Int64` | 64-bit | `±9.22 × 10^18` | Storage quota bytes, monotonic `dataVersion` |
+| `float` | `System.Single` | 32-bit | ~7 digits (Base-2) | `pgvector` embedding coordinates (`float[]`) |
+| `double` | `System.Double` | 64-bit | ~15-17 digits (Base-2) | RRF hybrid search scores, cosine similarity |
+| `decimal` | `System.Decimal` | 128-bit | 28-29 digits (Base-10) | `TenantPlanPricingCatalog` billing (`INR`, `USD`, `EUR`) |
+| `bool` | `System.Boolean` | 1 byte | `true` / `false` | Feature flags, `isAnnual`, soft-delete `IsDeleted` |
+| `char` | `System.Char` | 16-bit | UTF-16 code unit | Delimiters, Markdown `#` heading level counting |
+| `string` | `System.String` | Ref Type | Immutable UTF-16 text | `ExternalUserId`, tenant slugs, `ApiMessages` |
+| `Guid` | `System.Guid` | 128-bit | Globally unique ID | `TenantId`, `DocumentId`, `ConversationId` |
+| `DateTimeOffset` | `System.DateTimeOffset` | 128-bit | Date + time + UTC offset | Audit logs, `PendingApproval` expiration timestamps |
+| `TimeSpan` | `System.TimeSpan` | 64-bit | Duration | Redis cache sliding TTL (30s–5m), approval 15m TTL |
+
+**Literal Syntax Tips:**
+- Use underscore **digit separators** (`1_000_000`) to make large quotas or byte limits readable.
+- Use suffixes to control literal types: `m` for `decimal` (`29.99m`), `L` for `long` (`10_737_418_240L`), `f` for `float` (`0.85f`). Without `m`, `29.99` is a `double`!
+- Use `0x` for hexadecimal (`0xFF`) and `0b` for binary bitmasks (`0b0000_0100`).
+
+### `var`, Explicit Types, and Target-Typed `new()`
+
+C# 3.0 introduced `var` for **compile-time type inference**, and C# 9.0 added **target-typed `new()`** so you can omit repeating the type on the right-hand side.
+
+- **What it is:** `var` lets Roslyn deduce a local variable's static type from the right-hand expression; `new(...)` lets Roslyn deduce the constructed type from the left-hand declaration.
+- **Why use it:** Reduces visual noise on long generic types (`Dictionary<string, List<Guid>>`) while keeping 100% static type safety.
+- **How it works:** During Roslyn's **Semantic Analysis** phase, `var` is replaced with the exact inferred type in the compiled IL. `var` is *never* dynamic—reassigning `maxRetries = "three";` triggers compile error `CS0029`.
+- **When NOT to use `var`:**
+  - When the right-hand side is an opaque method call whose return type isn't obvious (`var result = await _mediator.Send(query);` can obscure whether `result` is a DTO, a nullable entity, or a `bool`).
+  - When you need a wider or decimal numeric type: `var price = 20;` infers `int`, and `var rate = 0.2;` infers `double` instead of `decimal`. Declare `decimal rate = 0.2m;` explicitly.
+  - Note that `var` can only be used for **local variables** (never class fields, method parameters, or return types).
+
+### `const` vs `readonly` vs `static readonly`
+
+- **`const`:** Must be evaluated at **compile time**. Roslyn bakes the literal value directly into the IL of every assembly that references it.
+  - **When NOT to use `const`:** Never use `const` for values that change across releases if external binaries might reference your DLL without recompiling, and never use it for values computed at runtime (like `DateTimeOffset.UtcNow` or `Guid.NewGuid()`).
+- **`readonly` (instance) & `static readonly`:** Evaluated at **runtime** (inline or inside a constructor/static constructor) and cannot be reassigned afterward. Use `static readonly` for shared runtime objects like `TimeSpan`, `Guid`, or `FrozenDictionary` lookup tables.
+
+### Arithmetic Overflow: `checked` vs `unchecked`
+
+By default, C# executes integer arithmetic in an **`unchecked`** context for raw CPU speed: adding `1` to `int.MaxValue` silently wraps around to `-2,147,483,648`. Wrapping critical calculations in a **`checked { ... }`** block (or `checked(a + b)`) forces the CLR to emit overflow-checking IL instructions (`add.ovf`) and throw an `OverflowException` instead of corrupting totals or quotas.
+- **When NOT to use global `checked`:** Enabling `<CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>` across an entire `.csproj` adds overflow instructions to every loop counter and index calculation; reserve `checked` for financial, billing, and quota boundaries.
+
+### Real-World Normora Examples
+
+**Example 1: Time-Ordered UUIDs and UTC Timestamps (`Guid.CreateVersion7`, `DateTimeOffset`, `TimeSpan`)**
+Using `Guid.CreateVersion7()` (.NET 9+/10) generates sequential, time-ordered IDs that prevent PostgreSQL B-tree index fragmentation, while `DateTimeOffset.UtcNow` prevents timezone drift.
+```csharp
+var tenantId = Guid.CreateVersion7();
+var approvalCreatedAt = DateTimeOffset.UtcNow;
+TimeSpan approvalTtl = TimeSpan.FromMinutes(15); // Server-enforced HITL approval TTL
+DateTimeOffset expiresAt = approvalCreatedAt.Add(approvalTtl);
+```
+
+**Example 2: Multi-Currency Billing with `decimal` (`TenantPlanPricingCatalog`)**
+Financial calculations in Normora's `Tenants` module strictly use `decimal` (`m` suffix) so the 20% annual discount never suffers Base-2 floating-point drift.
+```csharp
+decimal monthlyPriceUsd = 49.00m;
+decimal annualDiscountRate = 0.20m;
+decimal discountedAnnualTotal = monthlyPriceUsd * 12 * (1.0m - annualDiscountRate); // 470.400m
+```
+
+**Example 3: Centralized `const` Constants (`ApiMessages`) vs `static readonly` Limits**
+`ApiMessages` uses `const string` for zero-allocation, compile-time-constant error messages, whereas `TimeSpan` cache expirations use `static readonly` because `TimeSpan` cannot be `const`.
+```csharp
+public static class TenantCacheDefaults
+{
+    public const string KeyPrefix = "tenant:slug:";
+    public static readonly TimeSpan ResolutionSlidingTtl = TimeSpan.FromMinutes(5);
+}
+```
+
+**Example 4: Explicit Types vs `var` vs Target-Typed `new()` in CQRS Handlers**
+Use `var` when the constructor or literal makes the type obvious, target-typed `new()` for clean collection initialization, and explicit types when clarity matters.
+```csharp
+// Clear from right-hand side -> var is idiomatic
+var batchSize = 100; // Gemini batchEmbedContents limit
+// Target-typed new() avoids repeating the long type name
+Dictionary<Guid, int> chunkCountsByDocument = new();
+// Explicit type clarifies what Mediator returned when reading handler code
+PerformHybridRetrievalResponse retrievalResult = await _mediator.Send(query, cancellationToken);
+```
+
+**Example 5: `checked` Block for Document Quota & Token Budget Math**
+When accumulating tenant storage bytes or chunk counts, `checked` catches integer wraparound before a maliciously huge payload can wrap a positive usage counter into a negative number and bypass quota enforcement.
+```csharp
+int currentTokenCount = 2_147_483_000;
+int incomingChunkTokens = 1_500;
+
+checked
+{
+    // Throws OverflowException instead of wrapping to a negative number
+    int updatedTotal = currentTokenCount + incomingChunkTokens;
+}
+```
+
+## 5. Strings, Nullability, and Memory-Safe Text Handling
+
+Text processing and `null` safety are the single largest sources of runtime bugs and hidden memory allocations in enterprise web APIs. C# 14 on .NET 10 gives you expressive syntax to handle both cleanly at compile time.
+
+### String Immutability, Interpolation, and Raw String Literals
+
+In .NET, `string` is an **immutable reference type** (once created on the **Managed Heap**—the runtime memory area managed by the **Garbage Collector (GC)**—its characters can never change). Modifying a string with `+` allocates a brand-new `string` object every time.
+
+- **String Interpolation (`$""`):** In C# 10+, Roslyn lowers `$"Tenant {tenantId} uploaded {count} chunks"` into a `DefaultInterpolatedStringHandler` stack struct that writes directly into a character buffer without boxing value types (`Guid`, `int`).
+- **Verbatim Strings (`@""`):** Disable escape sequences (`\` is treated literally), useful for Windows paths or regexes.
+- **Raw String Literals (`"""..."""`, C# 11+):** Delimited by three or more double quotes. No escaping is needed for quotes, backslashes, or JSON braces, and common leading indentation is automatically stripped by the compiler. Prefix with `$$` to require `{{...}}` for interpolation while leaving single `{...}` literal (ideal for JSON templates).
+- **When NOT to use `+` concatenation:** Never concatenate strings with `+` inside a loop (such as building Markdown breadcrumbs across 500 chunks in `DocumentChunker`). Use `StringBuilder` or `string.Join`, and use `ReadOnlySpan<char>` (`AsSpan()`) when slicing without allocation.
+
+### Culture-Invariant Comparison & `nameof`
+
+- **Ordinal vs Culture-Sensitive Comparison:** Never compare API identifiers, currency codes, or tenant slugs with `==` after `.ToUpper()` or `.ToLower()`. Current-thread OS locale rules can break comparisons (famously the "Turkish-I" bug, where `'i'.ToUpper()` in `tr-TR` produces `'İ'` instead of `'I'`). Always use `.ToUpperInvariant()`, `.ToLowerInvariant()`, or `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`.
+- **`nameof` Operator:** Resolves the unqualified string name of a symbol (`nameof(tenantId)` -> `"tenantId"`) at compile time. In **C# 14**, `nameof` also supports unbound generic types such as `nameof(List<>)` (`"List"`).
+  - **When NOT to use `nameof`:** Do not use `nameof` for external API routes, database column names that must stay fixed across code refactors, or user-facing localized error messages (use `ApiMessages` constants instead).
+
+### Nullable Reference Types (NRTs) and Null Operators
+
+Historically, any reference variable in C# could hold `null` (a reference pointing to no object), causing `NullReferenceException` crashes at runtime. With `<Nullable>enable</Nullable>` (enabled by default in modern .NET 10 projects):
+- `string` means **non-nullable** (the compiler warns if you try to assign `null` or fail to initialize it).
+- `string?` means **explicitly nullable** (you must check for `null` before dereferencing).
+- `int?` (`Nullable<int>`) wraps a value type so it can also represent "missing."
+
+| Operator | Name | Behavior |
+|---|---|---|
+| `a ?? b` | Null-coalescing | Returns `a` if non-null; otherwise evaluates `b` |
+| `a ??= b` | Null-coalescing assignment | Assigns `b` to `a` only if `a` is `null` |
+| `a?.Prop` | Null-conditional access | Evaluates `Prop` if `a` is non-null; otherwise yields `null` |
+| `a?.Prop = b` | **C# 14** Null-conditional assignment | Evaluates `b` and assigns `Prop` only if `a` is non-null |
+| `a!` | Null-forgiving operator | Silences compiler warning **without** a runtime check |
+
+- **When NOT to use `!` (null-forgiving):** Never slap `!` onto nullable values just to silence compiler warnings (`tenant!.Slug`). If the value is actually `null` at runtime, the CLR still crashes with `NullReferenceException`. Use pattern matching (`if (tenant is null)`) or `ArgumentNullException.ThrowIfNull(tenant)` instead.
+
+### Real-World Normora Examples
+
+**Example 1: Zero-Boxing Agent Session Partition Key (`NormoraAgentIsolationKeyProvider`)**
+```csharp
+// Compiles to DefaultInterpolatedStringHandler in .NET 10 (no int/Guid boxing)
+Guid tenantId = Guid.CreateVersion7();
+string externalUserId = "oidc-sub-9482a";
+string sessionKey = $"{tenantId}:{externalUserId}";
+```
+
+**Example 2: Raw String Literal (`$$"""..."""`) for JSON-RPC 2.0 MCP Payloads**
+Inside Normora's `McpController` (`/api/mcp`), `$$"""` embeds JSON braces cleanly while interpolating C# variables via `{{...}}`.
+```csharp
+string toolName = "documents_search";
+string queryText = "parental leave policy";
+
+string mcpPayload = $$"""
+    {
+      "jsonrpc": "2.0",
+      "method": "tools/call",
+      "params": {
+        "name": "{{toolName}}",
+        "arguments": { "query": "{{queryText}}" }
+      }
+    }
+    """;
+```
+
+**Example 3: Culture-Invariant Currency Normalization (`UpdateTenantCurrencyCommand`)**
+```csharp
+string rawCurrency = "inr";
+string normalizedCurrency = rawCurrency.ToUpperInvariant(); // Always "INR", regardless of server locale
+bool isSupported = string.Equals(normalizedCurrency, "INR", StringComparison.Ordinal);
+```
+
+**Example 4: Guard Clauses & `nameof` (and C# 14 Unbound Generic `nameof`)**
+```csharp
+ArgumentException.ThrowIfNullOrWhiteSpace(externalUserId, nameof(externalUserId));
+// C# 14: unbound generic type in nameof for structured OpenTelemetry logging
+string handlerFamily = nameof(IRequestHandler<,>); // Evaluates to "IRequestHandler"
+```
+
+**Example 5: Nullable Value/Reference Types, `??`, and `??=` for Optional Scoping**
+```csharp
+Guid? departmentId = null; // Optional filter; user may query workspace-wide
+string? requestedSlug = null;
+
+// Falls back to "default" only when requestedSlug is null
+string effectiveSlug = requestedSlug ?? "default";
+// Assigns a default correlation ID only if none was provided
+string? correlationId = null;
+correlationId ??= Guid.CreateVersion7().ToString("N");
+```
+
+**Example 6: C# 14 Null-Conditional Assignment (`?.=`) on Optional Audit Metadata**
+In C# 14, `?.=` avoids wrapping optional property assignments in `if (entry is not null)` blocks, and skips evaluating the right-hand side if `entry` is `null`.
+```csharp
+AuditEntry? pendingAudit = TryGetPendingAudit();
+pendingAudit?.LastModifiedUtc = DateTimeOffset.UtcNow;
+```
+
+## 6. Operators, Expressions, and Statements
+
+An **expression** is code that evaluates to a value (e.g., `5 + 5` or `isAnnual ? 470.40m : 49.00m`). A **statement** is a complete instruction executed by the program, usually ending in a semicolon (`;`).
+
+### Arithmetic, Relational, and Precedence Rules
+C# supports arithmetic (`+`, `-`, `*`, `/`, `%`), compound assignment (`+=`, `-=`, `*=`), increment/decrement (`++i` pre-increment vs `i++` post-increment), and relational (`==`, `!=`, `<`, `>`, `<=`, `>=`) operators.
+
+**Integer Division Trap:** Dividing two `int` values in C# performs *integer truncation* (`7 / 2 == 3`, not `3.5`). Cast at least one operand to `double` or `decimal` (`7m / 2`) when fractional precision is needed.
 
 ```csharp
 int a = 10;
 int b = 3;
-int sum = a + b; // 13
-bool isGreater = a > b; // true
+int sum = a + b;         // 13
+int remainder = a % b;   // 1
+bool isGreater = a > b;  // true
 ```
 
-### Logical Operators
-Used for boolean logic: `&&` (AND), `||` (OR), `!` (NOT).
+### Logical Operators & Short-Circuit Evaluation
+Used for boolean logic: `&&` (logical AND), `||` (logical OR), `!` (logical NOT).
+- **Short-Circuit Evaluation:** In `if (condition1 && condition2)`, if `condition1` is `false`, the CLR *never* evaluates `condition2`. In `condition1 || condition2`, if `condition1` is `true`, `condition2` is skipped.
+- **When NOT to use `&` / `|` on booleans:** Single `&` and `|` do *not* short-circuit on booleans—they evaluate both sides unconditionally, which breaks null-guard expressions like `user != null & user.IsActive` (causing `NullReferenceException`). Reserve `&` and `|` for integer **bitwise flag** masks.
 
+### Ternary Conditional Operator (`?:`)
+A concise inline `if-else` expression: `condition ? valueIfTrue : valueIfFalse`.
+- **When NOT to use `?:`:** Never nest ternary operators inside each other (`a ? b : c ? d : e`). Nested ternaries harm readability; use a `switch` expression or explicit `if/else` instead.
+
+### Real-World Normora Examples
+
+**Example 1: Short-Circuit Guard Before Tenant Membership Check**
 ```csharp
-bool hasPower = true;
-bool isAuthorized = false;
-bool canCharge = hasPower && isAuthorized; // false
+string? externalUserId = GetExternalUserId();
+bool hasActiveMembership = !string.IsNullOrWhiteSpace(externalUserId) && IsWorkspaceMember(externalUserId);
 ```
 
-**Short-Circuit Evaluation:**
-If you write `if (condition1 && condition2)`, and `condition1` is false, the CLR will *never* evaluate `condition2`. This is critical for performance and null-checking: `if (user != null && user.IsAdmin)`.
+**Example 2: Ternary Expression for Subscription Cycle Display**
+```csharp
+bool isAnnualCycle = true;
+decimal monthlyBase = 49.00m;
+decimal billedAmount = isAnnualCycle ? monthlyBase * 12 * 0.80m : monthlyBase;
+```
 
-## 6. Control Flow
+**Example 3: Remainder (`%`) & Integer Division for Gemini Batching (`100` Chunks/Call)**
+Normora's ingestion pipeline calls Gemini's `batchEmbedContents` endpoint in slices of at most `100` chunks.
+```csharp
+int totalChunks = 245;
+int batchSize = 100;
+int fullBatches = totalChunks / batchSize;      // 2
+int trailingChunks = totalChunks % batchSize;   // 45
+int totalRequests = (totalChunks + batchSize - 1) / batchSize; // Ceiling division = 3
+```
 
-Control flow dictates the order in which statements are executed. 
+**Example 4: Bitwise Flags (`|`, `&`) for Compact RBAC Permission Masks**
+```csharp
+const int ReadDocs = 0b0001;
+const int UploadDocs = 0b0010;
+const int DeleteDocs = 0b0100;
 
-### The `if` Statement
+int editorMask = ReadDocs | UploadDocs; // 0b0011
+bool canDelete = (editorMask & DeleteDocs) == DeleteDocs; // false
+```
+
+**Example 5: Compound Assignment (`+=`, `??=`) in RAG Token Budgeting**
+```csharp
+int usedPromptTokens = 1_200;
+int retrievedChunkTokens = 450;
+usedPromptTokens += retrievedChunkTokens; // 1,650
+
+TimeSpan? customTimeout = null;
+customTimeout ??= TimeSpan.FromSeconds(30); // Applies default only when null
+```
+
+## 7. Control Flow, Pattern Matching, and Loops
+
+Control flow dictates the order in which statements execute. Modern C# blends traditional imperative branching (`if`, `switch`, loops) with concise, compiler-verified **pattern matching**.
+
+### The `if` Statement and Guard Clauses
 ```csharp
 int batteryPercentage = 85;
 
@@ -137,10 +418,22 @@ else
     Console.WriteLine("Low battery warning!");
 }
 ```
+**Architect Pattern — Guard Clauses:** Instead of nesting happy-path logic three `if` levels deep, validate preconditions up front and return or throw immediately. In Normora, this is how `BolaException` (404) and `BflaException` (403) protect every handler before touching business state.
 
-### The `switch` Statement and Jump Tables
+```mermaid
+flowchart TD
+    R["Incoming Request (TenantId, DocumentId, Role)"] --> T{"tenantId == Guid.Empty?"}
+    T -- "Yes" --> E1["Throw InvalidOperationException(ApiMessages.TenantContextMissing)"]
+    T -- "No" --> O{"Document exists in Tenant?"}
+    O -- "No (BOLA)" --> E2["Throw BolaException() -> HTTP 404"]
+    O -- "Yes" --> P{"Role permits action?"}
+    P -- "No (BFLA)" --> E3["Throw BflaException() -> HTTP 403"]
+    P -- "Yes" --> OK["Execute CQRS Handler"]
+```
 
-The `switch` statement is used when you have multiple discrete paths based on a single variable.
+### The `switch` Statement and Compiler Lowering (Jump Tables vs String Hashing)
+
+The `switch` statement dispatches execution across multiple discrete branches from a single value.
 
 ```csharp
 string command = "start";
@@ -162,47 +455,182 @@ switch (command)
 }
 ```
 
-**Compiler Internals:** Why use `switch` instead of a long chain of `if-else`? 
-If you have a large `switch` statement (e.g., on an `enum` or integer with many contiguous cases), the Roslyn compiler translates it into a **Jump Table** (using the `switch` IL instruction). 
+**Compiler Internals (Why `switch` Beats Long `if-else` Chains):**
+- **Contiguous Integers / Enums:** Roslyn emits an IL `switch` instruction backed by an **O(1) Jump Table**. Instead of evaluating conditions sequentially in O(n) time, the CPU calculates a memory offset and jumps straight to the matching case.
+- **Strings:** For small string switches (typically <= 6 cases), Roslyn emits sequential `string.Equals` or length/character checks. For larger string switches (7+ cases), Roslyn computes a deterministic **FNV-1a hash** (`ComputeStringHash`) at runtime, jumps via an O(1) hash jump table, and verifies exact string equality to guard against hash collisions.
 
-Instead of evaluating every condition one by one (O(n) time), the CPU calculates an memory offset and jumps directly to the correct case (O(1) time). This makes `switch` statements extremely fast for state machines and parsers.
+```mermaid
+flowchart TD
+    S["switch (value)"] --> K{"Value Type & Case Count"}
+    K -- "Dense int or enum" --> JT["IL switch Instruction: O(1) Jump Table"]
+    K -- "Small string (<= 6 cases)" --> SEQ["Length Check + string.Equals"]
+    K -- "Large string (7+ cases)" --> FNV["FNV-1a Hash -> O(1) Switch + Exact Equals"]
+```
 
-### Loops (`while`, `for`, `foreach`)
+### `switch` Expressions and Pattern Matching (C# 8–14)
 
-Loops allow you to execute a block of code multiple times.
+A **`switch` expression** evaluates directly to a value without `case:` or `break;` boilerplate, and pairs naturally with **pattern matching**:
+- **Constant & Relational Patterns:** `>= 0 and <= 100`
+- **Logical Patterns:** `is null`, `is not null`, `is "Pro" or "Enterprise"`
+- **List Patterns (C# 11+):** `args is ["--migrate", ..]` checks array length and prefix elements cleanly
+- **Discard Pattern (`_`):** Mandatory catch-all when cases are non-exhaustive (Roslyn emits warning `CS8509` if a switch expression misses a possible input!).
+- **When NOT to use `switch`:** Do not use a `switch` statement or expression to execute arbitrary multi-step side effects or when business rules must change dynamically at runtime (use polymorphism—covered in Chapter 6—or database-driven strategy tables instead).
 
-**`while` Loop:** Executes as long as a condition is true.
+### Loops (`while`, `do-while`, `for`, `foreach`) & `using` Declarations
+
+- **`while` Loop:** Evaluates condition *before* each iteration (0 or more runs).
+- **`do-while` Loop:** Evaluates condition *after* each iteration (guaranteed at least 1 run).
+- **`for` Loop:** Best when indexing or stepping by a fixed batch size (`i += 100`).
+- **`foreach` Loop:** Iterates cleanly over collections (`arrays`, `List<T>`, `ReadOnlySpan<char>`).
+  - *Compiler Internals:* Roslyn lowers `foreach` into a `while` loop calling `.GetEnumerator()`, `.MoveNext()`, and `.Current` (duck-typed pattern-based compilation). If the enumerator implements `IDisposable`, Roslyn wraps it in `try/finally` (`using`); for zero-allocation stack enumerators like `Span<T>.Enumerator`, no `try/finally` or heap allocation occurs.
+  - **When NOT to use `foreach`:** Avoid `foreach` if you need to modify/remove elements from a `List<T>` mid-iteration (throws `InvalidOperationException`) or when you need explicit index arithmetic (`for` is clearer).
+- **`using` Declaration (`using var`, C# 8+):** Automatically calls `Dispose()` at the end of the enclosing scope (closing file streams, HTTP responses, or `CancellationTokenSource`) without adding nested `{ ... }` braces.
+
 ```csharp
+// Classic loop examples
 int retries = 0;
 while (retries < 3)
 {
     Console.WriteLine($"Attempt {retries + 1} to connect...");
     retries++;
 }
-```
 
-**`for` Loop:** Best when you know exactly how many iterations you need.
-```csharp
 for (int i = 0; i < 5; i++)
 {
     Console.WriteLine($"Pinging charger port {i}");
 }
-```
 
-**`foreach` Loop:** The most common loop in enterprise C#, used to iterate over collections.
-```csharp
 string[] chargers = { "CHG-01", "CHG-02", "CHG-03" };
-
 foreach (string charger in chargers)
 {
     Console.WriteLine($"Checking status of {charger}");
 }
 ```
-*Note: Under the hood, `foreach` compiles into a state machine that calls `.GetEnumerator()` on the collection, allowing it to safely iterate through arrays, Lists, and database query results.*
 
-## 7. Real Production Case Study: EV Platform CLI
+### Real-World Normora Examples
 
-Let's combine these fundamentals to build the mock initialization routine of our EV Charger Configuration CLI.
+**Example 1: Guard-Clause BOLA & BFLA Authorization Check**
+```csharp
+if (document is null || document.TenantId != currentTenantId)
+{
+    // BOLA maps globally to HTTP 404 to prevent tenant resource enumeration
+    throw new BolaException();
+}
+
+if (!userHasManagePermission)
+{
+    // BFLA maps globally to HTTP 403 Forbidden
+    throw new BflaException();
+}
+```
+
+**Example 2: `switch` Expression for Multi-Currency Billing Validation (`CancelSubscriptionCommandHandler`)**
+```csharp
+string? tier = "Free";
+string errorMessage = tier switch
+{
+    "Free" => ApiMessages.CannotCancelFreePlan,
+    "Pro" or "Enterprise" => string.Empty,
+    null => ApiMessages.TenantContextMissing,
+    _ => ApiMessages.NotFound
+};
+```
+
+**Example 3: Relational + Logical Patterns for Document Upload Tiering**
+```csharp
+long fileSizeBytes = 4_200_000L;
+string ingestionPriority = fileSizeBytes switch
+{
+    <= 0 => "Invalid",
+    > 0 and <= 1_048_576 => "FastLane",       // <= 1 MB
+    > 1_048_576 and <= 25_000_000 => "Standard",
+    _ => "LargeChunked"
+};
+```
+
+**Example 4: List Pattern Matching on CLI Arguments (`Normora.Api`)**
+```csharp
+bool shouldRunMigrations = args is ["--migrate"] or ["--migrate", "--verbose"];
+```
+
+**Example 5: `for` Loop Batching Chunks for Gemini `batchEmbedContents` (Max 100/Call)**
+```csharp
+int totalChunks = 250;
+const int GeminiMaxBatchSize = 100;
+
+for (int offset = 0; offset < totalChunks; offset += GeminiMaxBatchSize)
+{
+    int count = Math.Min(GeminiMaxBatchSize, totalChunks - offset);
+    Console.WriteLine($"Embedding slice [{offset}..{offset + count})");
+}
+```
+
+**Example 6: `foreach` + `using var` Declaration Reading Document Markdown Lines**
+```csharp
+using var reader = new StringReader("# Policy\n## Leave\nEmployees receive 20 days.");
+string? line;
+while ((line = reader.ReadLine()) is not null)
+{
+    if (line.StartsWith('#'))
+    {
+        Console.WriteLine($"Breadcrumb heading detected: {line}");
+    }
+}
+```
+
+## 8. Real Production Case Studies
+
+### Case Study A: Normora Ingestion & Billing Preflight Runner
+This standalone top-level script demonstrates how Normora combines nullable safety, `decimal` currency math, `checked` quota validation, `switch` expressions, and `for` batch loops in `Normora.Worker`.
+
+```csharp
+using System;
+
+Console.WriteLine("=== Normora Tenant Ingestion & Billing Preflight ===");
+
+// 1. Strongly-typed identifiers, UTC timestamps, and decimal billing
+Guid tenantId = Guid.CreateVersion7();
+string? requestedCurrency = "inr";
+string normalizedCurrency = (requestedCurrency ?? "USD").ToUpperInvariant();
+bool isAnnualCycle = true;
+decimal monthlyBaseUsd = 49.00m;
+decimal finalPrice = isAnnualCycle ? monthlyBaseUsd * 12 * 0.80m : monthlyBaseUsd;
+
+// 2. Pattern matching & switch expression for tier validation
+string subscriptionTier = "Pro";
+string cancellationCheck = subscriptionTier switch
+{
+    "Free" => "Blocked: Cannot cancel Free tier.",
+    "Pro" or "Enterprise" => "Eligible for billing cycle update.",
+    _ => "Unknown tier."
+};
+
+Console.WriteLine($"Tenant {tenantId} | Currency: {normalizedCurrency} | Quote: {finalPrice:F2} | {cancellationCheck}");
+
+// 3. Checked quota math + Gemini batchEmbedContents chunking (100/call)
+int existingChunks = 1_950;
+int incomingChunks = 245;
+const int TenantChunkLimit = 5_000;
+const int GeminiBatchMax = 100;
+
+int newTotal = checked(existingChunks + incomingChunks);
+if (newTotal > TenantChunkLimit)
+{
+    Console.WriteLine("Quota exceeded: Aborting ingestion.");
+    return 1;
+}
+
+for (int offset = 0; offset < incomingChunks; offset += GeminiBatchMax)
+{
+    int batchCount = Math.Min(GeminiBatchMax, incomingChunks - offset);
+    Console.WriteLine($"Dispatching Gemini embedding batch [{offset}..{offset + batchCount})");
+}
+
+return 0;
+```
+
+### Case Study B: EV Platform Admin CLI
+Let's also trace a classic interactive command-line loop—the initialization routine of an EV Charger Configuration CLI—showing `while`, `Console.ReadLine()`, and a string `switch` statement working together.
 
 ```csharp
 using System;
@@ -252,14 +680,112 @@ if (!isConfigured)
 }
 ```
 
-## 8. Common Mistakes
+## 9. Common Mistakes & Anti-Patterns
 
 | Level | Mistake | Impact | How to Avoid |
-|-------|---------|--------|--------------|
+|---|---|---|---|
 | Beginner | Confusing `=` (assignment) and `==` (equality). | Logic bugs, syntax errors. | Remember `=` assigns a value, `==` compares two values. |
 | Beginner | Misunderstanding `var`. | Fear of dynamic typing in a static language. | Remember `var` is strictly resolved at compile-time by Roslyn. |
-| Intermediate | Using `double` for money/pricing. | Precision loss due to floating-point math (e.g., `0.1 + 0.2 != 0.3`). | Always use `decimal` for financial calculations. |
+| Intermediate | Using `double` for money/pricing. | Precision loss due to floating-point math (`0.1 + 0.2 != 0.3`). | Always use `decimal` for financial calculations. |
 | Senior | Huge `if/else` chains instead of `switch`. | Degraded CPU performance due to sequential branching. | Use `switch` to allow the compiler to generate O(1) jump tables. |
+
+> [!CAUTION]
+> **Anti-Pattern 1: Hardcoding Magic Strings Instead of `ApiMessages`**
+> **Wrong code:**
+> ```csharp
+> if (tenantId == Guid.Empty)
+> {
+>     throw new InvalidOperationException("Tenant context is missing.");
+> }
+> ```
+> **Why it's wrong:** Scattered literal strings drift out of sync with the Angular frontend's `ApiMessages` map, leak inconsistent wording across modules, and make refactoring error payloads fragile.
+> **The fix:** Reference centralized constants from `Normora.Shared.Constants.ApiMessages`:
+> ```csharp
+> if (tenantId == Guid.Empty)
+> {
+>     throw new InvalidOperationException(ApiMessages.TenantContextMissing);
+> }
+> ```
+
+> [!CAUTION]
+> **Anti-Pattern 2: Using `double` for Multi-Currency Billing (`TenantPlanPricingCatalog`)**
+> **Wrong code:**
+> ```csharp
+> double monthlyUsd = 29.99;
+> double annualTotal = monthlyUsd * 12 * 0.80; // 287.90400000000005 (IEEE 754 drift)
+> ```
+> **Why it's wrong:** `double` uses Base-2 floating-point representation. Fractions like `0.1` or `0.80` cannot be represented exactly, causing invoice totals and PayU checkout callback hashes to mismatch by fractions of a cent.
+> **The fix:** Always use `decimal` with the `m` literal suffix for money:
+> ```csharp
+> decimal monthlyUsd = 29.99m;
+> decimal annualTotal = monthlyUsd * 12 * 0.80m; // Exact Base-10: 287.9040m
+> ```
+
+> [!CAUTION]
+> **Anti-Pattern 3: Culture-Sensitive String Normalization (`.ToUpper()` / `==`)**
+> **Wrong code:**
+> ```csharp
+> string currency = inputCurrency.ToUpper();
+> if (currency == "INR") { /* ... */ }
+> ```
+> **Why it's wrong:** `.ToUpper()` uses `CultureInfo.CurrentCulture`. Under locales like Turkish (`tr-TR`), `"inr".ToUpper()` yields `"İNR"` (dotted capital `İ`), silently breaking currency routing and tenant slug lookups in production containers.
+> **The fix:** Always use invariant casing or `StringComparison.OrdinalIgnoreCase`:
+> ```csharp
+> string currency = inputCurrency.ToUpperInvariant();
+> if (string.Equals(currency, "INR", StringComparison.Ordinal)) { /* ... */ }
+> ```
+
+> [!CAUTION]
+> **Anti-Pattern 4: Silencing Null Warnings with the Null-Forgiving Operator (`!`)**
+> **Wrong code:**
+> ```csharp
+> string? externalUserId = GetExternalUserId();
+> int length = externalUserId!.Length; // Silences CS8602, still crashes at runtime!
+> ```
+> **Why it's wrong:** The `!` operator is purely a compile-time hint to Roslyn—it emits **zero** runtime checks. If `externalUserId` is `null` at runtime, the endpoint still throws an unhandled `NullReferenceException`.
+> **The fix:** Validate explicitly with pattern matching or BCL guard helpers:
+> ```csharp
+> string? externalUserId = GetExternalUserId();
+> ArgumentException.ThrowIfNullOrWhiteSpace(externalUserId, nameof(externalUserId));
+> int length = externalUserId.Length;
+> ```
+
+> [!CAUTION]
+> **Anti-Pattern 5: Leaking Raw Exception Messages (`CWE-209`) & String Concatenation in Loops**
+> **Wrong code:**
+> ```csharp
+> // 1. Exposing raw infrastructure details in worker notifications (CWE-209)
+> string userNotification = "Upload failed: " + ex.Message;
+>
+> // 2. Allocating N intermediate strings inside DocumentChunker
+> string breadcrumb = "";
+> foreach (string heading in headings)
+> {
+>     breadcrumb += heading + " > ";
+> }
+> ```
+> **Why it's wrong:** Concatenating `ex.Message` into user-facing notifications leaks internal database/S3 details (violating CWE-209 and Normora's security policy), while `+=` inside a loop creates `O(N²)` character copies on the Managed Heap.
+> **The fix:** Map worker failures to `ApiMessages` constants (keeping `ex` in structured logs) and use `string.Join` or `StringBuilder` for loop concatenation:
+> ```csharp
+> string userNotification = ApiMessages.NotFound; // Safe generic constant for user/admin UI
+> string breadcrumb = string.Join(" > ", headings);
+> ```
+
+> [!CAUTION]
+> **Anti-Pattern 6: Unchecked Arithmetic on Tenant Quotas & Token Budgets**
+> **Wrong code:**
+> ```csharp
+> int currentBytes = 2_147_483_000;
+> int addedBytes = 10_000;
+> int totalBytes = currentBytes + addedBytes; // Silently wraps to -2,147,473,648!
+> bool withinQuota = totalBytes <= 5_000_000; // Evaluates to TRUE!
+> ```
+> **Why it's wrong:** By default, C# integer overflow wraps silently in `unchecked` mode, turning a huge positive number into a negative number that bypasses `<=` quota checks.
+> **The fix:** Use `long` (`Int64`) for byte sizes and wrap critical quota/budget arithmetic in `checked`:
+> ```csharp
+> long totalBytes = checked((long)currentBytes + addedBytes);
+> bool withinQuota = totalBytes <= 5_000_000L; // Safely FALSE
+> ```
 
 ## 9. Interview Questions
 

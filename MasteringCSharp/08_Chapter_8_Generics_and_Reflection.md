@@ -2,45 +2,265 @@
 
 ## 1. Learning Objectives
 By the end of this chapter, you will be able to:
-- Explain the concept of Reified Generics and how the CLR handles Generic Type specialization.
-- Understand the deep performance penalties associated with Reflection.
-- Extract metadata using Custom Attributes.
-- Architect high-performance, compile-time metaprogramming using C# Source Generators.
+- Explain **Reified Generics**, open vs. closed generic types, static fields per closed type, and how **RyuJIT** specializes value types while sharing **`__Canon`** machine code for reference types.
+- Design type-safe APIs using generic constraints (including C# 11+ `static abstract` members and C# 13+ `allows ref struct` anti-constraints) and generic variance (`in` / `out`).
+- Diagnose the runtime cost of **Reflection** (metadata parsing, boxing, security checks, and lost JIT inlining) and accelerate unavoidable dynamic code using compiled `Expression` delegates and .NET 8–10 **`[UnsafeAccessor]`**.
+- Decorate and inspect metadata cleanly using **Custom Attributes** and C# 11+ **Generic Attributes**, while respecting NativeAOT and trimming constraints.
+- Architect high-performance, zero-reflection, AOT-compatible infrastructure using **`IIncrementalGenerator`** and built-in .NET 10 **Source Generators** (`System.Text.Json`, `[LoggerMessage]`, `[GeneratedRegex]`, `[OptionsValidator]`).
 
 ## 2. Introduction
 
-Enterprise software relies heavily on reusable infrastructure: Dependency Injection containers, Object-Relational Mappers (ORMs), and JSON Serializers. These libraries cannot be hardcoded to know about your specific `Tenant` or `EvCharger` classes. They must operate on code they have never seen before.
+Enterprise software relies heavily on reusable infrastructure: Dependency Injection (DI) containers, Object-Relational Mappers (ORMs) like Entity Framework Core, CQRS mediators like MediatR, validation pipelines like FluentValidation, and JSON serializers. These libraries cannot be hardcoded to know about Normora's specific `TenantMembership`, `Document`, `DocumentChunk`, or `ConversationTurn` classes—or any domain entity in another system. They must operate safely and quickly on types they have never seen before.
 
-To achieve this, C# provides two primary mechanisms: **Generics** (compile-time/JIT-time polymorphism) and **Reflection** (runtime type inspection). While both are incredibly powerful, they have vastly different performance profiles. 
+To achieve this, C# provides three complementary mechanisms across the compile-to-runtime spectrum:
+1. **Generics** (compile-time and JIT-time polymorphism): Parameterizing types and methods with `<T>` so the compiler enforces type safety and the Common Language Runtime (CLR) executes specialized machine code.
+2. **Reflection** (runtime metaprogramming): Inspecting assembly metadata tables, reading attributes, and invoking members dynamically at runtime when types are not known until the program runs.
+3. **Source Generators** (compile-time metaprogramming): Running analyzers inside the Roslyn compiler during the build to emit strongly-typed, zero-reflection C# code before the app ever starts.
 
-In recent years, the C# ecosystem has aggressively moved away from Reflection in favor of **Source Generators**—shifting the heavy lifting of metaprogramming from runtime to compile-time.
+In modern .NET 10 and C# 14 systems, the ecosystem has aggressively shifted away from runtime Reflection toward **Generics** and **Incremental Source Generators**—achieving the flexibility of dynamic frameworks without sacrificing throughput, startup latency, or **NativeAOT** (Ahead-Of-Time native binary compilation) compatibility.
 
-## 3. Generics and Reification
+## 3. Generics, Reification, and CLR Internals
 
-Generics were introduced in C# 2.0. Unlike Java, where Generics are implemented via **Type Erasure** (the compiler strips out generic types and treats everything as `Object` at runtime), C# Generics are **Reified**.
+### What Generics Are and Why Reification Matters
+Generics were introduced in C# 2.0. Before generics, reusable containers like `ArrayList` stored everything as `object`, forcing callers to cast on every read and **Box** (heap-allocate a wrapper around) every value type like `int` or `Guid`.
 
-Reification means the CLR knows exactly what type `T` is at runtime. 
+Unlike Java, where generics are implemented via **Type Erasure** (the compiler verifies types, then strips `<T>` away and treats everything as `Object` at runtime), C# generics are **Reified**. **Reification** means the generic type argument is preserved in the compiled **Intermediate Language (IL)** metadata and remains fully known to the CLR at runtime.
 
 ```csharp
 public class Cache<T>
 {
-    private Dictionary<string, T> _store = new();
-    
+    private readonly Dictionary<string, T> _store = new();
+
     public void Add(string key, T value) => _store[key] = value;
+
+    public Type StoredType => typeof(T); // Always accurate at runtime because T is reified!
 }
 ```
 
-### JIT Compilation of Generics
+### Open vs. Closed Generic Types and Static Fields
+When you define `Cache<T>` without specifying `T`, it is an **open generic type** (`typeof(Cache<>)`). You cannot instantiate an open generic type directly; you must supply type arguments to create a **closed generic type** (such as `Cache<Guid>` or `Cache<DocumentSummaryDto>`).
 
-When you instantiate a generic type, RyuJIT handles it based on whether `T` is a Reference Type or a Value Type.
+> [!IMPORTANT]
+> **Every closed generic type gets its own static fields.**
+> In the CLR, `MetricCounter<UploadDocumentCommand>.Count` and `MetricCounter<PerformHybridRetrievalQuery>.Count` are two completely independent static memory slots—even though both close over reference types!
 
-1. **Value Types (`int`, `struct`):**
-   If you create a `Cache<int>`, the JIT compiler generates a *completely distinct* set of native machine code specifically for `int`. If you create a `Cache<double>`, it generates another set of native code for `double`. This ensures maximum performance and exact memory alignment, completely avoiding Boxing.
+### JIT Compilation of Generics: Value Types vs. `__Canon`
+When **RyuJIT** (the .NET Just-In-Time compiler) compiles a closed generic type or method, it chooses between two strategies depending on whether `T` is a **Value Type** or a **Reference Type**:
 
-2. **Reference Types (`string`, `EvCharger`):**
-   Because all Reference Types are essentially just 8-byte pointers (on a 64-bit OS), the JIT compiler is smart. It compiles the machine code for `Cache<object>` exactly once, and shares that exact same native code for `Cache<string>`, `Cache<EvCharger>`, and any other reference type. 
+1. **Value Types (`int`, `Guid`, `DateTime`, custom `struct`):**
+   Every value type can have a different byte size and memory layout (`int` is 4 bytes; `Guid` is 16 bytes). Therefore, RyuJIT generates a **completely distinct** copy of native machine code for each closed value-type instantiation (`Cache<int>`, `Cache<Guid>`, `Cache<double>`). This guarantees exact CPU register alignment, enables method inlining, and eliminates boxing completely.
 
-**Architectural Rule:** Generics are the highest-performing way to write reusable code in C#. Prefer Generics with constraints (`where T : class`) over interfaces or base classes whenever possible to allow the JIT to optimize the dispatch.
+2. **Reference Types (`string`, `Document`, `TenantMembership`, `EvCharger`):**
+   On a 64-bit OS, every reference type variable is an 8-byte managed pointer. Because the pointer size and calling convention are identical regardless of the class, RyuJIT compiles the native machine code once using an internal placeholder type called **`System.__Canon`** (canonical reference type) and shares that single machine-code body across `Cache<string>`, `Cache<Document>`, `Cache<TenantMembership>`, and `Cache<EvCharger>`.
+   To still make `typeof(T)`, `is T`, or `new T()` work accurately inside shared `__Canon` code, the CLR attaches a hidden **Generic Lookup Dictionary** to each closed type's `MethodTable` (type descriptor) and passes a runtime handle when needed.
+
+```mermaid
+flowchart TD
+    Open["Open Generic Type: PagedResult of T"]
+    Open -->|"T = Guid (Value Type, 16 bytes)"| VT1["Closed Type: PagedResult of Guid"]
+    Open -->|"T = long (Value Type, 8 bytes)"| VT2["Closed Type: PagedResult of long"]
+    Open -->|"T = DocumentDto (Ref Type, 8-byte ptr)"| RT1["Closed Type: PagedResult of DocumentDto"]
+    Open -->|"T = TenantDto (Ref Type, 8-byte ptr)"| RT2["Closed Type: PagedResult of TenantDto"]
+
+    VT1 --> JIT1["Dedicated Native Code 1 (No Boxing)"]
+    VT2 --> JIT2["Dedicated Native Code 2 (No Boxing)"]
+    RT1 --> Canon["Shared Native Code via System.__Canon"]
+    RT2 --> Canon
+    Canon -.->|"Runtime type ops via MethodTable"| Dict["Per-Type Generic Dictionary"]
+```
+
+**Architectural Rule:** Generics are the highest-performing way to write reusable code in C#. Prefer constrained Generics (`where T : class` or `where T : struct`) over `object` or weakly-typed base abstractions so RyuJIT can specialize or devirtualize dispatch.
+
+### Generic Constraints (C# 2 through C# 14)
+Without constraints, the compiler assumes `T` only supports `System.Object` members (`ToString`, `Equals`, `GetHashCode`). **Generic constraints** (`where T : ...`) restrict which types a caller can supply, unlocking richer operations at compile time:
+
+| Constraint | Meaning | Primary Use Case |
+|---|---|---|
+| `where T : class` | Reference type (non-nullable under `#nullable enable`) | DTO envelopes, entities, null-checkable services |
+| `where T : struct` | Non-nullable value type (excludes `Nullable<T>`) | Zero-allocation structs, IDs, metrics |
+| `where T : notnull` | Non-nullable reference or value type | Dictionary keys, cache keys |
+| `where T : unmanaged` | Blittable value type with no managed references | Vector buffers (`pgvector` floats), `Span<byte>` interop |
+| `where T : new()` | Must expose a public parameterless constructor | Generic factories (note: emits `Activator.CreateInstance<T>()` unless paired with `static abstract`) |
+| `where T : BaseType, IMyInterface` | Must inherit/implement specified contracts | CQRS handlers, domain entities |
+| `where T : IMyInterface<T>` | **Curiously Recurring Template Pattern (CRTP)** / `static abstract` | Strongly-typed IDs, `IParsable<T>`, fluent builders |
+| `where T : allows ref struct` | **Anti-constraint (C# 13+ / C# 14)**: permits stack-only `ref struct` types such as `Span<T>` | Zero-allocation parsers, streaming tokenizers |
+
+> [!TIP]
+> **Why `static abstract` beats `new()` in modern .NET:**
+> In older C#, `where T : new()` forced the runtime to invoke `Activator.CreateInstance<T>()` under the hood. Since C# 11, an interface can declare `static abstract T Create(...)`, letting the JIT emit a direct static call with zero reflection overhead!
+
+### Generic Variance: Covariance (`out`) and Contravariance (`in`)
+By default, generic types are **invariant**: even though `DocumentUploadedEvent` derives from `DomainEvent`, `List<DocumentUploadedEvent>` is **not** assignable to `List<DomainEvent>` (otherwise someone could call `.Add(new TenantDeletedEvent())` and corrupt the list).
+
+When an interface or delegate only **produces** or only **consumes** `T`, C# lets you declare **variance**:
+- **Covariance (`out T`)**: `T` appears only in output/return positions (`IEnumerable<out T>`, `IReadOnlyList<out T>`). Preserves assignment compatibility (`IReadOnlyList<DocumentChunk>` → `IReadOnlyList<object>`).
+- **Contravariance (`in T`)**: `T` appears only in input/parameter positions (`IComparer<in T>`, `Action<in T>`, `ICommandHandler<in TCommand>`). Reverses assignment compatibility (`IComparer<object>` → `IComparer<DocumentChunk>`).
+- **Invariance (`T`)**: `T` is both read and written (`IList<T>`, `DbSet<T>`). No implicit conversion is allowed.
+
+```mermaid
+flowchart LR
+    Sub["Derived Type: DocumentChunk"] -->|"is a"| Base["Base Type: TenantEntity"]
+    Cov1["IReadOnlyList of DocumentChunk (out T)"] -->|"Covariance preserves direction"| Cov2["IReadOnlyList of TenantEntity"]
+    Contra2["IComparer of TenantEntity (in T)"] -->|"Contravariance reverses direction"| Contra1["IComparer of DocumentChunk"]
+```
+
+### When NOT to Use Generics
+- **Do not over-abstract EF Core behind `IRepository<T>`:** Wrapping `DocumentsDbContext` or `TenantsDbContext` in a generic `IRepository<T>` hides EF Core capabilities such as `.Include()`, pgvector HNSW distance ordering, and `GroupBy` anonymous projections. Use CQRS handlers directly against the module's private `DbContext`.
+- **Avoid exploding value-type permutations on cold paths:** Instantiating huge generic classes across dozens of different `struct` types multiplies JIT native code size and CPU instruction-cache pressure.
+- **Do not use `T` when runtime heterogeneity is required:** A heterogeneous list of MCP tools (`IAgentTool`) belongs in an interface collection `IReadOnlyList<IAgentTool>`, not convoluted generic wrappers.
+
+### Real-World Normora Examples: Generics in Action
+
+#### Example 1: `ApiResponse<T>` and `PagedResult<T>` Envelopes in `Normora.Shared`
+Normora returns structured JSON envelopes across `Tenants`, `Documents`, and `Conversations`. Because C# generics are reified, `ApiResponse<Guid>` does not box the `Guid`, while `ApiResponse<DocumentSummaryDto>` and `ApiResponse<ConversationSummaryDto>` share `__Canon` native code:
+
+```csharp
+namespace Normora.Shared.Models;
+
+public sealed record ApiResponse<T>(
+    bool Success,
+    T? Data,
+    string? Message = null)
+{
+    public static ApiResponse<T> Ok(T data) => new(true, data);
+
+    // Always uses Normora.Shared.Constants.ApiMessages — never magic strings.
+    public static ApiResponse<T> Failure(string message) => new(false, default, message);
+}
+
+public sealed record PagedResult<TItem>(
+    IReadOnlyList<TItem> Items,
+    int Page,
+    int PageSize,
+    int TotalCount) where TItem : notnull;
+```
+
+#### Example 2: Per-Closed-Type Static Metadata in `TenantScopedCacheKey<TResource>`
+Each closed generic type has its own static `Prefix` field, computed once per type with zero dictionary lookups on subsequent cache hits in Redis:
+
+```csharp
+namespace Normora.Infrastructure.Services.Caching;
+
+public static class TenantScopedCacheKey<TResource> where TResource : class
+{
+    // Computed once per closed type (e.g., TenantBranding vs TenantMembershipSummary)
+    private static readonly string ResourcePrefix = typeof(TResource).Name.ToLowerInvariant();
+
+    public static string ForTenant(Guid tenantId, string key) =>
+        $"normora:tenant:{tenantId:N}:{ResourcePrefix}:{key}";
+}
+
+// Usage:
+// "normora:tenant:...:tenantbranding:theme" vs "normora:tenant:...:tenantrolecache:user42"
+```
+
+#### Example 3: Constrained CQRS Pipeline Behavior Across Normora Modules
+In Normora's CQRS pipeline, cross-module contracts in `Normora.Shared.Contracts.*` enforce explicit `Guid TenantId` for multi-tenant defense-in-depth. Generic constraints let a single `TenantIsolationBehavior<TRequest, TResponse>` validate every tenant-scoped MediatR request at compile time:
+
+```csharp
+using MediatR;
+using Normora.Shared.Constants;
+
+namespace Normora.Shared.Contracts;
+
+public interface ITenantScopedRequest
+{
+    Guid TenantId { get; }
+}
+
+public sealed class TenantIsolationBehavior<TRequest, TResponse>(ITenantContext tenantContext)
+    : IPipelineBehavior<TRequest, TResponse>
+    where TRequest : IRequest<TResponse>, ITenantScopedRequest
+{
+    public async Task<TResponse> Handle(
+        TRequest request,
+        RequestHandlerDelegate<TResponse> next,
+        CancellationToken cancellationToken)
+    {
+        if (request.TenantId == Guid.Empty || tenantContext.TenantId != request.TenantId)
+        {
+            throw new InvalidOperationException(ApiMessages.TenantContextMissing);
+        }
+
+        return await next(cancellationToken);
+    }
+}
+```
+
+#### Example 4: `static abstract` Strongly-Typed IDs (C# 11–14)
+Using `static abstract` interface members, Normora can build strongly-typed IDs (`TenantId`, `DocumentId`, `ConversationId`) that support generic parsing without `Activator.CreateInstance<T>()` reflection:
+
+```csharp
+public interface IStronglyTypedId<TSelf> where TSelf : struct, IStronglyTypedId<TSelf>
+{
+    Guid Value { get; }
+    static abstract TSelf From(Guid value);
+}
+
+public readonly record struct DocumentId(Guid Value) : IStronglyTypedId<DocumentId>
+{
+    public static DocumentId From(Guid value) => new(value);
+}
+
+public static class RouteIdParser
+{
+    // Direct static dispatch by JIT — zero boxing, zero Activator.CreateInstance!
+    public static TId ParseOrThrow<TId>(string raw)
+        where TId : struct, IStronglyTypedId<TId>
+    {
+        if (!Guid.TryParse(raw, out var parsed))
+        {
+            throw new BolaException(); // Mapped globally to 404 Not Found
+        }
+
+        return TId.From(parsed);
+    }
+}
+```
+
+#### Example 5: `allows ref struct` Anti-Constraint for Zero-Allocation Chunking (C# 13+ / C# 14)
+Before C# 13, a generic method could never accept `ReadOnlySpan<char>` because `ref struct` types cannot live on the managed heap. With `allows ref struct`, `DocumentChunker` can accept stack-only slices in generic helper pipelines:
+
+```csharp
+public interface IHeadingVisitor<TContext> where TContext : allows ref struct
+{
+    void OnHeading(ReadOnlySpan<char> headingText, int level, ref TContext context);
+}
+
+public static class MarkdownScanner
+{
+    public static void ScanLine<TVisitor, TContext>(
+        ReadOnlySpan<char> line,
+        TVisitor visitor,
+        ref TContext context)
+        where TVisitor : struct, IHeadingVisitor<TContext>
+        where TContext : allows ref struct
+    {
+        if (line.StartsWith("## "))
+        {
+            visitor.OnHeading(line[3..], 2, ref context);
+        }
+    }
+}
+```
+
+#### Example 6: Contravariant Event Dispatching (`in TEvent`) for Workspace State Sync
+Normora synchronizes `dataVersion` across tenants via `IWorkspaceStateSynchronizer`. A contravariant handler interface lets a general audit subscriber handle specific document or membership events seamlessly:
+
+```csharp
+public abstract record WorkspaceMutationEvent(Guid TenantId, long DataVersion);
+public sealed record DocumentIngestedEvent(Guid TenantId, long DataVersion, Guid DocumentId)
+    : WorkspaceMutationEvent(TenantId, DataVersion);
+
+public interface IWorkspaceEventSink<in TEvent> where TEvent : WorkspaceMutationEvent
+{
+    ValueTask PublishAsync(TEvent evt, CancellationToken ct);
+}
+
+// A sink accepting any WorkspaceMutationEvent can satisfy IWorkspaceEventSink<DocumentIngestedEvent>
+IWorkspaceEventSink<WorkspaceMutationEvent> globalAuditSink = new AuditWorkspaceSink();
+IWorkspaceEventSink<DocumentIngestedEvent> docSink = globalAuditSink; // Valid via 'in'!
+```
 
 ## 4. Reflection and Runtime Metaprogramming
 
